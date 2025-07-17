@@ -11,7 +11,7 @@
 در ترمینال لینوکس (Ubuntu/Debian) فقط این دستور را وارد کنید:
 
 ```bash
-bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/rasim-gh/cloudflare_dns_bot/main/setup.sh)
+bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/0fariid0/cloudflare_dns_bot/main/setup.sh)
 ```
 
 > این دستور به صورت خودکار:
@@ -82,13 +82,6 @@ ADMIN_ID = اایدی عددی تلگرام
 
 ---
 
-## 👨‍💻 توسعه‌دهنده
-
-- طراحی و توسعه: [Rasim Ghodrati](https://t.me/rasim_gh)
-- Telegram Bot Framework: `python-telegram-bot v20+`
-- Cloudflare API: کاملاً ماژولار و قابل گسترش
-
----
 
 ## 🧾 لایسنس
 
