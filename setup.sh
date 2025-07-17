@@ -31,7 +31,7 @@ show_menu() {
 install_bot() {
   echo "📦 Installing the bot..."
   rm -rf "$INSTALL_DIR"
-  git clone https://github.com/rasim-gh/cloudflare_dns_bot.git "$INSTALL_DIR"
+  git clone https://github.com/0fariid0/cloudflare_dns_bot.git "$INSTALL_DIR"
   cd "$INSTALL_DIR" || exit
   bash install.sh
   echo "✅ Installation completed successfully."
