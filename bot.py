@@ -250,7 +250,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[uid].update({"mode": "editing_ttl", "record_id": record_id})
         keyboard = [
             [
-                InlineKeyboardButton("1 دقیقه (خودکار)", callback_data=f"update_ttl_{record_id}_1"),
+                InlineKeyboardButton("Auto (خودکار)", callback_data=f"update_ttl_{record_id}_1"),
+                InlineKeyboardButton("1 دقیقه", callback_data=f"update_ttl_{record_id}_60"),
+            ],
+            [
                 InlineKeyboardButton("2 دقیقه", callback_data=f"update_ttl_{record_id}_120"),
                 InlineKeyboardButton("5 دقیقه", callback_data=f"update_ttl_{record_id}_300"),
             ],
@@ -436,7 +439,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state[uid]["record_step"] = 3
             keyboard = [
                 [
-                    InlineKeyboardButton("1 دقیقه (خودکار)", callback_data="select_ttl_1"),
+                    InlineKeyboardButton("Auto (خودکار)", callback_data="select_ttl_1"),
+                    InlineKeyboardButton("1 دقیقه", callback_data="select_ttl_60"),
+                ],
+                [
                     InlineKeyboardButton("2 دقیقه", callback_data="select_ttl_120"),
                     InlineKeyboardButton("5 دقیقه", callback_data="select_ttl_300"),
                 ],
