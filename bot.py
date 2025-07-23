@@ -31,7 +31,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zones = get_zones()
     except Exception as e:
         logger.error(f"Could not fetch zones: {e}")
-        await (update.message or update.callback_query.message).reply_text("❌ خطا در ارتباط با Cloudflare. لطفاً بعداً تلاش کنید.")
+        await (update.message or update.callback_query.message).reply_text("❌ خطا در ارتباط با Cloudflare.")
         return
 
     keyboard = []
@@ -184,6 +184,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
     
+    if data == "back_to_records":
+        await refresh_records(uid, update, page=user_state[uid].get("page", 0))
+        return
+
     if data == "show_help":
         await show_help(update, context)
         return
@@ -231,9 +235,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("toggle_proxy_"):
         record_id = data.split("_")[2]
         try:
-            updated_record = toggle_proxied_status(zone_id, record_id)
-            if updated_record:
-                await query.answer(f"✅ پروکسی {'فعال' if updated_record.get('proxied') else 'غیرفعال'} شد.")
+            success = toggle_proxied_status(zone_id, record_id)
+            if success:
+                await query.answer("✅ وضعیت پروکسی تغییر کرد.")
                 await show_record_settings(query.message, uid, zone_id, record_id)
             else:
                 await query.answer("❌ عملیات ناموفق بود.", show_alert=True)
@@ -241,6 +245,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error toggling proxy for {record_id}: {e}")
             await query.answer("❌ خطا در ارتباط با API.", show_alert=True)
             
+    elif data.startswith("edittll_"):
+        record_id = data.split("_")[1]
+        user_state[uid].update({"mode": "editing_ttl", "record_id": record_id})
+        keyboard = [
+            [
+                InlineKeyboardButton("1 دقیقه (خودکار)", callback_data=f"update_ttl_{record_id}_1"),
+                InlineKeyboardButton("2 دقیقه", callback_data=f"update_ttl_{record_id}_120"),
+                InlineKeyboardButton("5 دقیقه", callback_data=f"update_ttl_{record_id}_300"),
+            ],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ]
+        await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+
     elif data.startswith("update_ttl_"):
         parts = data.split("_")
         record_id, ttl = parts[2], int(parts[3])
@@ -250,7 +267,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             success = update_dns_record(zone_id, record_id, record["name"], record["type"], record["content"], ttl, record.get("proxied", False))
             if success:
-                await query.answer(f"✅ TTL به {ttl} تغییر یافت.")
+                await query.answer(f"✅ TTL تغییر یافت.")
                 await show_record_settings(query.message, uid, zone_id, record_id)
             else:
                 await query.answer("❌ عملیات ناموفق بود.", show_alert=True)
@@ -263,7 +280,89 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[uid].update({"mode": "editing_ip", "record_id": record_id})
         await query.message.edit_text("📝 لطفاً IP جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
 
-    # Incomplete: Add other handlers for adding/deleting records/zones here
+    elif data == "add_record":
+        user_state[uid].update({
+            "mode": "adding_record_step",
+            "record_step": 0,
+            "record_data": {},
+        })
+        keyboard = [
+            [
+                InlineKeyboardButton("A", callback_data="select_type_A"),
+                InlineKeyboardButton("AAAA", callback_data="select_type_AAAA"),
+                InlineKeyboardButton("CNAME", callback_data="select_type_CNAME")
+            ],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")],
+        ]
+        await query.message.edit_text("📌 مرحله ۱ از ۵: نوع رکورد را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("select_type_"):
+        rtype = data.split("_")[2]
+        user_state[uid]["record_data"] = {"type": rtype}
+        user_state[uid]["record_step"] = 1
+        await query.message.edit_text("📌 مرحله ۲ از ۵: نام رکورد را وارد کنید (مثال: sub یا @ برای ریشه)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
+
+    elif data.startswith("select_ttl_"):
+        ttl_value = int(data.split("_")[2])
+        user_state[uid]["record_data"]["ttl"] = ttl_value
+        user_state[uid]["record_step"] = 4
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ بله", callback_data="select_proxied_true"),
+                InlineKeyboardButton("❌ خیر", callback_data="select_proxied_false")
+            ],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ]
+        await query.message.edit_text("📌 مرحله ۵ از ۵: آیا پروکسی فعال باشد؟", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("select_proxied_"):
+        proxied = data.endswith("true")
+        user_state[uid]["record_data"]["proxied"] = proxied
+        r_data = user_state[uid]["record_data"]
+        zone_name = user_state[uid]["zone_name"]
+        
+        name = r_data["name"]
+        if name == "@":
+            name = zone_name
+        elif not name.endswith(f".{zone_name}"):
+            name = f"{name}.{zone_name}"
+
+        await query.message.edit_text("⏳ در حال ایجاد رکورد...")
+        try:
+            success = create_dns_record(zone_id, r_data["type"], name, r_data["content"], r_data["ttl"], r_data["proxied"])
+            if success:
+                await query.message.edit_text("✅ رکورد با موفقیت اضافه شد.")
+            else:
+                await query.message.edit_text("❌ افزودن رکورد ناموفق بود.")
+        except Exception as e:
+            logger.error(f"Error creating record: {e}")
+            await query.message.edit_text("❌ خطا در ایجاد رکورد.")
+        finally:
+            reset_user_state(uid, keep_zone=True)
+            await refresh_records(uid, update)
+
+    elif data.startswith("confirm_delete_"):
+        record_id = data.split("_")[2]
+        keyboard = [
+            [InlineKeyboardButton("✅ بله، حذف شود", callback_data=f"delete_record_{record_id}")],
+            [InlineKeyboardButton("❌ لغو", callback_data="back_to_records")]
+        ]
+        await query.message.edit_text("❗ آیا از حذف این رکورد مطمئن هستید؟", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("delete_record_"):
+        record_id = data.split("_")[2]
+        await query.message.edit_text("⏳ در حال حذف رکورد...")
+        try:
+            success = delete_dns_record(zone_id, record_id)
+            if success:
+                await query.message.edit_text("✅ رکورد حذف شد.")
+            else:
+                await query.message.edit_text("❌ حذف رکورد ناموفق بود.")
+        except Exception as e:
+            logger.error(f"Error deleting record {record_id}: {e}")
+            await query.message.edit_text("❌ خطا در حذف رکورد.")
+        finally:
+            await refresh_records(uid, update, page=user_state[uid].get("page", 0))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,6 +376,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not mode: return
 
+    if mode == "adding_domain":
+        await update.message.reply_text(f"⏳ در حال افزودن دامنه `{text}`...")
+        try:
+            success, result = add_domain_to_cloudflare(text)
+            if success:
+                zone_info = get_zone_info_by_id(result['id'])
+                ns = "\n".join(zone_info.get("name_servers", ["N/A"]))
+                await update.message.reply_text(
+                    f"✅ دامنه `{text}` با موفقیت اضافه شد.\n"
+                    f"**وضعیت:** `{zone_info['status']}`\n\n"
+                    f"❗️ لطفاً Name Server های دامنه خود را به موارد زیر تغییر دهید:\n`{ns}`",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(f"❌ خطا در افزودن دامنه: {result}")
+        except Exception as e:
+            logger.error(f"Error adding domain {text}: {e}")
+            await update.message.reply_text(f"❌ خطا در افزودن دامنه.")
+        finally:
+            reset_user_state(uid)
+            await start(update, context)
+        return
+
     zone_id = state.get("zone_id")
     record_id = state.get("record_id")
 
@@ -289,7 +411,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success = update_dns_record(zone_id, record_id, record["name"], record["type"], new_ip, record["ttl"], record.get("proxied", False))
                 if success:
                     await update.message.reply_text("✅ آی‌پی با موفقیت به‌روز شد.")
-                    reset_user_state(uid, keep_zone=True)
                     new_msg = await update.message.reply_text("...در حال بارگذاری تنظیمات جدید")
                     await show_record_settings(new_msg, uid, zone_id, record_id)
                 else:
@@ -301,8 +422,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ خطا در ارتباط با API.")
         finally:
             reset_user_state(uid, keep_zone=True)
-    
-    # Incomplete: Add other message handlers for adding domains/records here
+
+    elif mode == "adding_record_step":
+        step = state.get("record_step", 0)
+        
+        if step == 1:
+            user_state[uid]["record_data"]["name"] = text
+            user_state[uid]["record_step"] = 2
+            await update.message.reply_text("📌 مرحله ۳ از ۵: مقدار رکورد را وارد کنید (مثلاً IP یا آدرس):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
+        
+        elif step == 2:
+            user_state[uid]["record_data"]["content"] = text
+            user_state[uid]["record_step"] = 3
+            keyboard = [
+                [
+                    InlineKeyboardButton("1 دقیقه (خودکار)", callback_data="select_ttl_1"),
+                    InlineKeyboardButton("2 دقیقه", callback_data="select_ttl_120"),
+                    InlineKeyboardButton("5 دقیقه", callback_data="select_ttl_300"),
+                ],
+                [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+            ]
+            await update.message.reply_text("📌 مرحله ۴ از ۵: مقدار TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 if __name__ == "__main__":
