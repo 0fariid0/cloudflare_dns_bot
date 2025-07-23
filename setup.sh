@@ -5,6 +5,8 @@ SERVICE_NAME="cloudflarebot"
 # At the very beginning of setup.sh
 if [ -d "$INSTALL_DIR/.git" ]; then
   cd "$INSTALL_DIR" || exit
+  # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
+  git reset --hard origin/main
   git pull origin main
   cd - || exit
 fi
@@ -59,6 +61,8 @@ update_bot() {
   else
     echo "🔄 Updating the bot to the latest version..."
     cd "$INSTALL_DIR" || exit
+    # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
+    git reset --hard origin/main
     git pull origin main
     echo "🔄 Restarting the bot service..."
     systemctl restart "$SERVICE_NAME"
