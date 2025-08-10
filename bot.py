@@ -131,26 +131,32 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def refresh_records(uid, update: Update, page=0):
-    """بارگذاری و نمایش رکوردها با pagination مدرن‌تر.
+    """بارگذاری و نمایش رکوردها با pagination مدرن‌تر و مقاوم در برابر خطا.
 
-    تغییرات ظاهری و کاربردی:
-    - هدر زیباتر با فرمت MarkdownV2 و نمایش تعداد کل رکوردها.
-    - نوار پیشرفت (dots) برای نشان دادن صفحه فعلی.
-    - دکمه‌های شماره‌گذاری شده (حداکثر 5 صفحه دیده می‌شود) برای حرکت سریع.
-    - دکمه‌های خروجی (Export) برای گرفتن JSON/CSV از رکوردهای فعلی.
-    - محافظت در برابر صفحه‌های خارج از محدوده (clamp).
+    این نسخه:
+    - از متن ساده (plain) استفاده می‌کند تا مشکلات فرمتینگ با parse_mode کاهش یابد.
+    - از وریفای برای تعیین پیام (edit یا reply) استفاده می‌کند.
+    - دکمه‌های شماره‌گذاری، نوار پیشرفت و export ساده را نگه می‌دارد.
     """
-    def escape_md(text: str) -> str:
-        import re
-        return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
-
-    zone_id = user_state[uid]["zone_id"]
+    zone_id = user_state[uid].get("zone_id")
     zone_name = user_state[uid].get("zone_name", "")
+
+    # تلاش برای گرفتن رکوردها
     try:
         records = get_dns_records(zone_id)
     except Exception as e:
         logger.error(f"Could not fetch records for zone {zone_id}: {e}")
-        await update.callback_query.message.reply_text("❌ خطا در دریافت لیست رکوردها.")
+        # سعی در پاسخ به پیام کاربر (اگر ممکن باشد)
+        if hasattr(update, "callback_query") and update.callback_query:
+            try:
+                await update.callback_query.message.reply_text("❌ خطا در دریافت لیست رکوردها.")
+            except Exception:
+                logger.exception("Failed to notify user about fetch error")
+        elif hasattr(update, "message") and update.message:
+            try:
+                await update.message.reply_text("❌ خطا در دریافت لیست رکوردها.")
+            except Exception:
+                logger.exception("Failed to notify user about fetch error")
         return
 
     total_records = len(records)
@@ -165,53 +171,55 @@ async def refresh_records(uid, update: Update, page=0):
     user_state[uid]["page"] = page
     page_display = page + 1 if total_pages > 0 else 0
 
-    # create a compact progress indicator (● full, ○ empty) up to 7 symbols
-    max_dots = min(total_pages, 7)
+    # progress dots
     if total_pages == 0:
         dots = "(هیچ رکوردی)"
     else:
+        max_dots = min(total_pages, 7)
         center = page
-        # build a window around current page
         start_dot = max(0, min(center - max_dots // 2, total_pages - max_dots))
         dots_list = ["○"] * total_pages
         for i in range(start_dot, start_dot + max_dots):
             dots_list[i] = "●" if i == page else "○"
         dots = "".join(dots_list[start_dot:start_dot + max_dots])
 
-    header = f"*📋 رکوردهای DNS*  —  `{escape_md(zone_name)}`  
-`{total_records}` رکورد  •  صفحه *{page_display}/{total_pages}*
+    header = f"📋 رکوردهای DNS — {zone_name}
+{total_records} رکورد • صفحه {page_display}/{total_pages}
 {dots}
 
 "
 
-    # build keyboard
+    # build keyboard and body lines
     keyboard = []
+    body_text = header
 
     if total_records == 0:
-        body_text = header + "هیچ رکوردی برای این دامنه ثبت نشده است."
+        body_text += "هیچ رکوردی برای این دامنه ثبت نشده است."
     else:
-        body_text = header
         start_index = page * RECORDS_PER_PAGE
         end_index = min(start_index + RECORDS_PER_PAGE, total_records)
         for rec in records[start_index:end_index]:
-            if rec["type"] in ["A", "AAAA", "CNAME"]:
-                # نمایش خلاصه رکورد به صورت: name — content (type)
-                name = rec["name"].replace(f".{zone_name}", "").replace(zone_name, "@")
-                content = rec["content"]
-                summary = f"`{escape_md(name)}` — `{escape_md(content)}` ({escape_md(rec['type'])})"
-                keyboard.append([InlineKeyboardButton(summary, callback_data=f"record_settings_{rec['id']}")])
+            if rec.get("type") in ["A", "AAAA", "CNAME"]:
+                name = rec.get("name", "")
+                if zone_name and name.endswith(f".{zone_name}"):
+                    name = name.replace(f".{zone_name}", "")
+                elif name == zone_name:
+                    name = "@"
+                content = rec.get("content", "")
+                summary = f"{name} — {content} ({rec.get('type')})"
+                # use a single-button row pointing to record settings (safer label length)
+                keyboard.append([InlineKeyboardButton(summary, callback_data=f"record_settings_{rec.get('id')}")])
 
-    # navigation buttons (First / Prev / numbered / Next / Last)
+    # navigation
     if total_pages > 1:
         nav_row = []
         if page > 0:
             nav_row.append(InlineKeyboardButton("⏮️", callback_data="goto_page_1"))
             nav_row.append(InlineKeyboardButton("⬅️", callback_data="page_prev"))
-        # numbered buttons: show up to 5 centered around current page
         num_buttons = min(5, total_pages)
         start_num = max(1, page_display - num_buttons // 2)
         if start_num + num_buttons - 1 > total_pages:
-            start_num = total_pages - num_buttons + 1
+            start_num = max(1, total_pages - num_buttons + 1)
         num_row = []
         for p in range(start_num, start_num + num_buttons):
             label = f"[{p}]" if p == page_display else str(p)
@@ -219,24 +227,34 @@ async def refresh_records(uid, update: Update, page=0):
         if page < total_pages - 1:
             nav_row.append(InlineKeyboardButton("➡️", callback_data="page_next"))
             nav_row.append(InlineKeyboardButton("⏭️", callback_data=f"goto_page_{total_pages}"))
-        # append nav row and numeric row
         if nav_row:
             keyboard.append(nav_row)
         keyboard.append(num_row)
 
-    # action row: add, refresh, export
-    action_row = [InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record"), InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")]
-    keyboard.append(action_row)
-    export_row = [InlineKeyboardButton("📤 Export JSON", callback_data="export_json"), InlineKeyboardButton("📤 Export CSV", callback_data="export_csv")]
-    keyboard.append(export_row)
+    # action and export rows
+    keyboard.append([InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record"), InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")])
+    keyboard.append([InlineKeyboardButton("📤 Export JSON", callback_data="export_json"), InlineKeyboardButton("📤 Export CSV", callback_data="export_csv")])
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_domains")])
 
-    # send or edit message
-    try:
-        await update.callback_query.message.edit_text(body_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception:
-        await update.callback_query.message.reply_text(body_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    # choose message object (edit if callback, otherwise reply)
+    message_obj = None
+    if hasattr(update, "callback_query") and update.callback_query and getattr(update.callback_query, "message", None):
+        message_obj = update.callback_query.message
+    elif hasattr(update, "message") and update.message:
+        message_obj = update.message
 
+    if not message_obj:
+        logger.warning("No message object available to send refresh_records output")
+        return
+
+    try:
+        # prefer edit_text to keep chat tidy
+        await message_obj.edit_text(body_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        try:
+            await message_obj.reply_text(body_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception:
+            logger.exception("Failed to send refresh_records message")
 
 async def show_record_settings(message, uid, zone_id, record_id):
     # This function is complete
@@ -336,16 +354,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "export_json":
-        # ارسال JSON رکوردهای فعلی به‌صورت متن
         try:
             zone_id_local = user_state[uid].get("zone_id")
             records = get_dns_records(zone_id_local)
             text = json.dumps(records, ensure_ascii=False, indent=2)
-            # اگر خیلی طولانیه، یک پیغام کوتاه بده
-            if len(text) > 3000:
-                await query.message.reply_text("✅ خروجی JSON آماده است — بیش از حد بزرگ برای پیام. لطفاً از Export CSV استفاده کنید یا از لاگ‌ها فایل بگیر." )
-            else:
-                await query.message.reply_text(f"`{text}`", parse_mode="Markdown")
+            from io import BytesIO
+            bio = BytesIO(text.encode('utf-8'))
+            bio.name = f"{user_state[uid].get('zone_name','records')}.json"
+            await context.bot.send_document(chat_id=uid, document=bio)
         except Exception:
             await query.answer("❌ امکان تهیه خروجی وجود ندارد.", show_alert=True)
         return
@@ -354,17 +370,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             zone_id_local = user_state[uid].get("zone_id")
             records = get_dns_records(zone_id_local)
-            # ساده‌سازی: تولید CSV کم‌حجم در متن
-            lines = ["id,type,name,content,ttl,proxied"]
+            import csv
+            from io import StringIO, BytesIO
+            si = StringIO()
+            writer = csv.writer(si)
+            writer.writerow(["id","type","name","content","ttl","proxied"])
             for r in records:
-                lines.append(f"{r['id']},{r['type']},{r['name']},{r['content']},{r.get('ttl','')},{r.get('proxied',False)}")
-            csv_text = "\n".join(lines)
-            if len(csv_text) > 3000:
-                await query.message.reply_text("✅ خروجی CSV آماده است — بیش از حد بزرگ برای پیام. لطفاً از روش دیگری برای دریافت فایل استفاده کنید.")
-            else:
-                await query.message.reply_text(f"```
-{csv_text}
-```")
+                writer.writerow([r.get('id',''), r.get('type',''), r.get('name',''), r.get('content',''), r.get('ttl',''), r.get('proxied',False)])
+            csv_bytes = si.getvalue().encode('utf-8')
+            bio = BytesIO(csv_bytes)
+            bio.name = f"{user_state[uid].get('zone_name','records')}.csv"
+            await context.bot.send_document(chat_id=uid, document=bio)
         except Exception:
             await query.answer("❌ امکان تهیه خروجی وجود ندارد.", show_alert=True)
         return
