@@ -126,10 +126,18 @@ def reset_user_state(uid, keep_zone=False):
     else:
         user_state.pop(uid, None)
 
-# --- ADDED: Unauthorized Access Handler ---
+# --- ADDED: Unauthorized Access Handlers ---
+async def show_request_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("✉️ ارسال درخواست دسترسی", callback_data="request_access")]]
+    text = "❌ شما به این ربات دسترسی ندارید. برای ارسال درخواست به مدیر، دکمه زیر را فشار دهید."
+    if update.callback_query:
+        await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def handle_unauthorized_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"Unauthorized access attempt by user {user.id} ({user.first_name})")
+    logger.info(f"Access request initiated by user {user.id} ({user.first_name})")
     
     keyboard = [[
         InlineKeyboardButton("✅ تایید", callback_data=f"access_approve_{user.id}"),
@@ -144,7 +152,8 @@ async def handle_unauthorized_access(update: Update, context: ContextTypes.DEFAU
     
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        await update.effective_message.reply_text("⏳ درخواست دسترسی شما برای مدیر ارسال شد. لطفاً منتظر بمانید.")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("✅ درخواست شما با موفقیت برای مدیر ارسال شد. لطفاً منتظر بمانید.")
     except Exception as e:
         logger.error(f"Failed to send access request to admin: {e}")
 
@@ -287,18 +296,56 @@ async def manage_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """...""" # Text of help is omitted for brevity
+    help_text = """
+🤖 *راهنمای ربات مدیریت Cloudflare DNS*
+
+این ربات به شما اجازه می‌دهد تا دامنه‌ها و رکوردهای DNS خود را در حساب Cloudflare به راحتی مدیریت کنید.
+
+---
+### **بخش ۱: مدیریت دامنه‌ها**
+
+-   *نمایش دامنه‌ها:* در منوی اصلی، لیست تمام دامنه‌های شما نمایش داده می‌شود.
+-   *افزودن دامنه:* با زدن دکمه `➕ افزودن دامنه`، می‌توانید نام دامنه جدیدی (مثلاً `example.com`) را وارد کنید. پس از افزودن، باید **Name Server** های دامنه خود را به مواردی که ربات اعلام می‌کند تغییر دهید.
+-   *حذف دامنه:* با زدن دکمه `🗑` کنار هر دامنه، می‌توانید آن را از حساب Cloudflare خود حذف کنید. (این عمل غیرقابل بازگشت است!)
+
+---
+### **بخش ۲: مدیریت رکوردها**
+
+برای مدیریت رکوردهای یک دامنه، کافیست روی نام آن در لیست کلیک کنید.
+
+-   *افزودن رکورد:*
+    1.  دکمه `➕ افزودن رکورد` را بزنید.
+    2.  **نوع رکورد** را انتخاب کنید (`A`, `AAAA`, `CNAME`).
+    3.  **نام رکورد** را وارد کنید. برای دامنه اصلی (root)، از علامت `@` استفاده کنید. برای ساب‌دامین، نام آن را وارد کنید (مثلاً `sub`).
+    4.  **مقدار رکورد** را وارد کنید (مثلاً آدرس IP برای رکورد `A` یا یک دامنه دیگر برای `CNAME`).
+    5.  **TTL** (Time To Live) را انتخاب کنید. مقدار `Auto` توصیه می‌شود.
+    6.  **وضعیت پروکسی** را مشخص کنید. فعال بودن پروکسی (`✅`) باعث می‌شود ترافیک شما از طریق Cloudflare عبور کرده و IP اصلی سرور شما مخفی بماند.
+
+-   *ویرایش رکورد:*
+    -   با کلیک بر روی دکمه `⚙️` کنار هر رکورد، وارد تنظیمات آن می‌شوید.
+    -   *تغییر IP:* برای به‌روزرسانی آدرس IP رکورد.
+    -   *تغییر TTL:* برای تغییر زمان کش شدن اطلاعات DNS.
+    -   *پروکسی:* برای فعال/غیرفعال کردن پروکسی Cloudflare.
+
+-   *حذف رکورد:* در منوی تنظیمات هر رکورد، با زدن دکمه `🗑 حذف` می‌توانید آن را پاک کنید.
+
+---
+برای بازگشت به منوی قبل از دکمه‌های `🔙 بازگشت` و برای لغو عملیات از دکمه `❌ لغو` استفاده کنید.
+    """
     keyboard = [[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]]
     await update.effective_message.edit_text(
-        help_text, reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown", disable_web_page_preview=True
+        help_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
 
 async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.effective_message
     if not is_user_authorized(user_id):
-        await message.reply_text("❌ شما اجازه دسترسی ندارید."); return
+        if is_user_blocked(user_id): return
+        await show_request_access_menu(update, context); return
     
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
@@ -337,13 +384,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_authorized(user_id):
         if is_user_blocked(user_id): return
-        await handle_unauthorized_access(update, context)
+        await show_request_access_menu(update, context)
         return
     await show_main_menu(update, context)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     uid = query.from_user.id; data = query.data
+    
+    if data == "request_access":
+        if is_user_blocked(uid): return
+        await handle_unauthorized_access(update, context)
+        return
     
     if data.startswith("access_"):
         if uid != ADMIN_ID:
@@ -367,7 +419,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_user_authorized(uid):
         if is_user_blocked(uid): return
-        await handle_unauthorized_access(update, context)
+        await show_request_access_menu(update, context)
         return
 
     state = user_state.get(uid, {}); zone_id = state.get("zone_id")
@@ -479,7 +531,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item_type = "record" if data.startswith("confirm_delete_record_") else "zone"
         item_id = data.split("_")[-1]
         text = f"❗ آیا از حذف این {'رکورد' if item_type == 'record' else 'دامنه'} مطمئن هستید؟"
-        back_action = "back_to_records" if item_type == 'record' else 'back_to_main'
+        # The back action should now go to the settings menu for records
+        back_action = f"record_settings_{item_id}" if item_type == 'record' else 'back_to_main'
         keyboard = [[InlineKeyboardButton("✅ بله، حذف شود", callback_data=f"delete_{item_type}_{item_id}")], [InlineKeyboardButton("❌ لغو", callback_data=back_action)]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -500,7 +553,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_user_authorized(uid):
         if is_user_blocked(uid): return
-        await handle_unauthorized_access(update, context)
+        await show_request_access_menu(update, context)
         return
     
     state = user_state.get(uid, {}); mode = state.get("mode"); text = update.message.text.strip()
