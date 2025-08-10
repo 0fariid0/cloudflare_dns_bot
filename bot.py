@@ -238,7 +238,7 @@ async def refresh_records(uid, update: Update, page=0):
         await update.callback_query.message.reply_text(body_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def show_record_settings(message, uid, zone_id, record_id(message, uid, zone_id, record_id):
+async def show_record_settings(message, uid, zone_id, record_id):
     # This function is complete
     try:
         record = get_record_details(zone_id, record_id)
