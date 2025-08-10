@@ -287,10 +287,9 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_main")]
     ])
     
-    # پیام را ویرایش یا ارسال می‌کند
     if update.callback_query:
         await update.effective_message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-    else: # این حالت برای بازگشت به منو بعد از عملیات متنی است
+    else:
         await context.bot.send_message(chat_id=uid, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_record_settings(message, uid, zone_id, record_id):
@@ -311,27 +310,23 @@ async def show_record_settings(message, uid, zone_id, record_id):
     await message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = "متن راهنمای شما در اینجا قرار می‌گیرد..." # For brevity
+    help_text = "متن راهنمای شما در اینجا قرار می‌گیرد..."
     await update.effective_message.edit_text(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]))
 
-# --- FIXED: تابع نمایش لاگ‌ها تکمیل شد ---
 async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         await update.effective_message.reply_text("❌ شما اجازه دسترسی به این بخش را ندارید.")
         return
-    
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            last_lines = f.readlines()[-20:] # نمایش 20 لاگ آخر
+            last_lines = f.readlines()[-20:]
     except FileNotFoundError:
         await update.effective_message.reply_text("فایل لاگ یافت نشد. هنوز فعالیتی ثبت نشده است.")
         return
-        
     if not last_lines:
         await update.effective_message.reply_text("هنوز هیچ فعالیتی ثبت نشده است.")
         return
-
     formatted_log = "📜 **۲۰ فعالیت آخر ربات:**\n" + "-"*20
     for line in reversed(last_lines):
         match = re.search(r'\[(.*?)\] User: (\d+) \| Action: (.*)', line)
@@ -340,7 +335,6 @@ async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dt_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
         formatted_time = dt_obj.strftime("%H:%M | %Y/%m/%d")
         formatted_log += f"\n\n- `{action}`\n  (توسط کاربر `{log_user_id}` در {formatted_time})"
-
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]])
     if update.callback_query:
         await update.effective_message.edit_text(formatted_log, parse_mode="Markdown", reply_markup=reply_markup)
@@ -395,7 +389,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not mode or mode == State.NONE: return
 
-    # --- ADDING USER ---
     if mode == State.ADDING_USER and uid == ADMIN_ID:
         try:
             new_user_id = int(text)
@@ -411,7 +404,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manage_whitelist_menu(update, context)
         return
 
-    # --- CLONING RECORD ---
     elif mode == State.CLONING_NEW_IP:
         new_ip = text; clone_data = user_state[uid].get("clone_data", {}); zone_id = state.get("zone_id"); full_name = clone_data.get("name")
         if not all([new_ip, clone_data, zone_id, full_name]):
@@ -425,9 +417,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e: logger.error(f"Error creating cloned record: {e}"); await update.message.reply_text("❌ خطا در ارتباط با API.")
         finally:
             reset_user_state(uid, keep_zone=True)
-            await show_records_list(update, context) # FIXED: Return to menu
+            await show_records_list(update, context)
 
-    # --- EDITING IP ---
     elif mode == State.EDITING_IP:
         new_ip = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
         await update.message.reply_text(f"⏳ در حال به‌روزرسانی IP...", parse_mode="Markdown")
@@ -437,15 +428,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if update_dns_record(zone_id, record_id, record["name"], record["type"], new_ip, record["ttl"], record.get("proxied", False)):
                     log_action(uid, f"UPDATE IP for '{record['name']}' to '{new_ip}'")
                     await update.message.reply_text("✅ آی‌پی با موفقیت به‌روز شد.")
-                    # FIXED: Return to menu (record settings)
                     new_msg = await update.message.reply_text("...در حال بارگذاری تنظیمات جدید")
                     await show_record_settings(new_msg, uid, zone_id, record_id)
-                else: await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
-            else: await update.message.reply_text("❌ رکورد مورد نظر یافت نشد.")
-        except Exception: await update.message.reply_text("❌ خطا در ارتباط با API.")
-        finally: reset_user_state(uid, keep_zone=True)
+                else: 
+                    await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
+                    reset_user_state(uid, keep_zone=True)
+                    await show_records_list(update, context)
+            else: 
+                await update.message.reply_text("❌ رکورد مورد نظر یافت نشد.")
+                reset_user_state(uid, keep_zone=True)
+                await show_records_list(update, context)
+        except Exception: 
+            await update.message.reply_text("❌ خطا در ارتباط با API.")
+            reset_user_state(uid, keep_zone=True)
+            await show_records_list(update, context)
 
-    # --- ADDING RECORD ---
     elif mode == State.ADDING_RECORD_NAME:
         user_state[uid]["record_data"]["name"] = text
         user_state[uid]["mode"] = State.ADDING_RECORD_CONTENT
@@ -520,22 +517,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cancel_action":
         reset_user_state(uid, keep_zone=True); await query.message.edit_text("❌ عملیات لغو شد."); await show_records_list(update, context)
     elif data.startswith("zone_"):
-        selected_zone_id = data.split("_")[1]
-        zone_info = get_zone_info_by_id(selected_zone_id)
+        selected_zone_id = data.split("_")[1]; zone_info = get_zone_info_by_id(selected_zone_id)
         if zone_info:
             user_state[uid].update({"zone_id": selected_zone_id, "zone_name": zone_info["name"]}); await show_records_list(update, context)
     elif data.startswith("record_settings_"):
         await show_record_settings(query.message, uid, zone_id, data.split("_")[-1])
     elif data.startswith("clone_record_"):
-        record_id = data.split("_")[-1]
-        original_record = get_record_details(zone_id, record_id)
+        record_id = data.split("_")[-1]; original_record = get_record_details(zone_id, record_id)
         if not original_record: await query.answer("❌ رکورد اصلی یافت نشد.", show_alert=True); return
         user_state[uid]["clone_data"] = { "name": original_record["name"], "type": original_record["type"], "ttl": original_record["ttl"], "proxied": original_record.get("proxied", False) }
         user_state[uid]["mode"] = State.CLONING_NEW_IP
         await query.message.edit_text(f"🐑 **کلون کردن رکورد**\n`{original_record['name']}`\n\nلطفاً **IP جدید** را وارد کنید:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("toggle_proxy_"):
-        record_id = data.split("_")[-1]
-        record_details = get_record_details(zone_id, record_id)
+        record_id = data.split("_")[-1]; record_details = get_record_details(zone_id, record_id)
         if toggle_proxied_status(zone_id, record_id):
             log_action(uid, f"Toggled proxy for '{record_details.get('name', record_id)}'"); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.", show_alert=True)
@@ -570,7 +564,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_action(uid, f"CREATE record '{full_name}' with content '{r_data['content']}'")
             await query.message.edit_text("✅ رکورد با موفقیت اضافه شد.")
         else: await query.message.edit_text("❌ افزودن رکورد ناموفق بود.")
-        reset_user_state(uid, keep_zone=True); await show_records_list(update, context) # FIXED: Return to menu
+        reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
     elif data.startswith("confirm_delete_"):
         parts, item_type, item_id = data.split('_'), data.split('_')[2], data.split('_')[-1]
         back_action = "delete_domain_menu" if item_type == "zone" else f"record_settings_{item_id}"
@@ -583,14 +577,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if delete_zone(zone_to_delete_id):
             log_action(uid, f"DELETED ZONE: '{zone_name}'"); await query.message.edit_text("✅ دامنه با موفقیت حذف شد.")
         else: await query.message.edit_text("❌ حذف دامنه ناموفق بود.")
-        await show_main_menu(update, context) # FIXED: Return to menu
+        await show_main_menu(update, context)
     elif data.startswith("delete_record_"):
-        record_id = data.split("_")[-1]; record_details = get_record_details(zone_id, record_id)
+        record_id = data.split("_")[-1]; 
+        # --- FIXED: Get record details BEFORE deleting to log its content ---
+        record_details = get_record_details(zone_id, record_id)
         await query.message.edit_text("⏳ در حال حذف رکورد...")
         if delete_dns_record(zone_id, record_id):
-            log_action(uid, f"DELETE record '{record_details.get('name', 'N/A')}'"); await query.message.edit_text("✅ رکورد حذف شد.")
+            if record_details:
+                log_action(uid, f"DELETE record '{record_details.get('name', 'N/A')}' with content '{record_details.get('content', 'N/A')}'")
+            else:
+                log_action(uid, f"DELETE record with ID '{record_id}' (details not found).")
+            await query.message.edit_text("✅ رکورد حذف شد.")
         else: await query.message.edit_text("❌ حذف رکورد ناموفق بود.")
-        await show_records_list(update, context) # FIXED: Return to menu
+        await show_records_list(update, context)
 
 # --- Main Application ---
 def main():
@@ -598,7 +598,7 @@ def main():
     logger.info("Starting bot...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("logs", show_logs)) # FIXED: Handler for /logs command
+    app.add_handler(CommandHandler("logs", show_logs))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
