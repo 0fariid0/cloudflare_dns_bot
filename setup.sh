@@ -1,88 +1,47 @@
-#!/bin/bash
-
-INSTALL_DIR="/root/cloudflare_dns_bot"
-SERVICE_NAME="cloudflarebot"
-LOG_DIR="$INSTALL_DIR/logs"
-
-# At the very beginning of setup.sh
-if [ -d "$INSTALL_DIR/.git" ]; then
-  cd "$INSTALL_DIR" || exit
-  # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
-  git reset --hard origin/main
-  git pull origin main
-  cd - || exit
-fi
-
-show_menu() {
-  clear
-  echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-  echo "┃   ⚙️ Cloudflare DNS Bot Installer     ┃"
-  echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
-  echo "1) 🛠  Install the bot"
-  echo "2) ⚙️  Configure the bot"
-  echo "3) 🔄 Update the bot"
-  echo "4) ❌ Uninstall the bot"
-  echo "5) 📜 View logs"
-  echo "0) 🚪 Exit"
-  echo ""
-  read -p "Your choice: " choice
-}
-
-install_bot() {
-  echo "📦 Installing the bot..."
-  rm -rf "$INSTALL_DIR"
-  git clone https://github.com/0fariid0/cloudflare_dns_bot.git "$INSTALL_DIR"
-  cd "$INSTALL_DIR" || exit
-  bash install.sh
-  echo "✅ Installation completed successfully."
-  read -p "⏎ Press Enter to return to the menu..." _
-}
-
-configure_bot() {
-  CONFIG_FILE="$INSTALL_DIR/config.py"
-  if [ ! -f "$CONFIG_FILE" ]; then
-    echo "⚠️ Config file not found. Please install the bot first."
-  else
-    echo "📝 Opening the config file..."
-    sleep 1
-    nano "$CONFIG_FILE"
-    echo "🔄 Restarting the bot service..."
-    systemctl restart "$SERVICE_NAME"
-    echo "✅ Configuration saved and bot restarted."
-  fi
-  read -p "⏎ Press Enter to return to the menu..." _
-}
-
-update_bot() {
-  if [ ! -d "$INSTALL_DIR/.git" ]; then
-    echo "⚠️ Git repository not found. Please install the bot first."
-  else
-    echo "🔄 Updating the bot to the latest version..."
-    cd "$INSTALL_DIR" || exit
-    # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
-    git reset --hard origin/main
-    git pull origin main
-    echo "🔄 Restarting the bot service..."
-    systemctl restart "$SERVICE_NAME"
-    echo "✅ Bot updated and restarted successfully."
-  fi
-  read -p "⏎ Press Enter to return to the menu..." _
-}
-
 view_logs() {
   # make sure log dir exists (for saved exports)
   mkdir -p "$LOG_DIR"
 
-  if ! systemctl status "$SERVICE_NAME" >/dev/null 2>&1; then
-    echo "⚠️ سرویس $SERVICE_NAME پیدا نشد یا فعال نیست."
+  # find candidate service units that mention 'cloud' or 'cloudflare'
+  echo "🔎 Searching for related systemd units..."
+  candidates=$(systemctl list-units --type=service --all --no-legend | awk '{print $1, $2, $3, $4}' | grep -iE 'cloud|cloudflare' || true)
+
+  if [ -z "$candidates" ]; then
+    echo "⚠️ هیچ سرویس systemd مرتبط پیدا نشد."
+    echo "لیست کامل سرویس‌ها که عبارت cloud یا cloudflare را دارند:"
+    systemctl list-units --type=service --all | grep -iE 'cloud|cloudflare' || true
+    echo ""
+    echo "اگر می‌خواهی هنوز لاگ‌ش را ببینی، نام unit را وارد کن (یا Enter برای بازگشت):"
+    read -p "Unit name: " maybe_unit
+    if [ -z "$maybe_unit" ]; then
+      read -p "⏎ Press Enter to return to the menu..." _
+      return
+    else
+      UNIT="$maybe_unit"
+    fi
+  else
+    echo "🔔 سرویس‌های پیدا شده:"
+    echo "$candidates"
+    echo ""
+    echo "لطفاً نام دقیق unit را وارد کن (مثلاً cloudflarebot.service) یا Enter برای انتخاب اولین مورد:"
+    read -p "Unit name: " UNIT
+    if [ -z "$UNIT" ]; then
+      # pick the first column (unit name) of first candidate
+      UNIT=$(echo "$candidates" | head -n1 | awk '{print $1}')
+    fi
+  fi
+
+  if [ -z "$UNIT" ]; then
+    echo "❌ واحدی انتخاب نشده. بازگشت به منو."
     read -p "⏎ Press Enter to return to the menu..." _
     return
   fi
 
+  # permissive: run journalctl even if unit is inactive
   while true; do
     clear
     echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-    echo "┃      View logs for $SERVICE_NAME     ┃"
+    echo "┃      View logs for $UNIT      ┃"
     echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
     echo "1) 📄 Show last 200 lines"
     echo "2) ▶️ Follow live (journalctl -f)"
@@ -95,24 +54,23 @@ view_logs() {
     case $lchoice in
       1)
         echo "----- Last 200 lines -----"
-        journalctl -u "$SERVICE_NAME" -n 200 --no-pager
+        sudo journalctl -u "$UNIT" -n 200 --no-pager || sudo journalctl | grep -i "$UNIT" || true
         echo "--------------------------"
         read -p "⏎ Press Enter to continue..." _
         ;;
       2)
         echo "----- Following logs (Ctrl+C to stop) -----"
-        journalctl -u "$SERVICE_NAME" -f
-        # when user Ctrl+C, they'll return here
+        sudo journalctl -u "$UNIT" -f
         ;;
       3)
-        # pipe to less for paging
-        journalctl -u "$SERVICE_NAME" | less
+        # pipe to less for paging (use --no-pager to get full output then less)
+        sudo journalctl -u "$UNIT" --no-pager | less
         ;;
       4)
         TIMESTAMP=$(date +"%F_%H%M%S")
-        OUTFILE="$LOG_DIR/${SERVICE_NAME}_logs_${TIMESTAMP}.log"
+        OUTFILE="$LOG_DIR/${UNIT}_logs_${TIMESTAMP}.log"
         echo "Saving last 1000 lines to $OUTFILE ..."
-        journalctl -u "$SERVICE_NAME" -n 1000 --no-pager > "$OUTFILE"
+        sudo journalctl -u "$UNIT" -n 1000 --no-pager > "$OUTFILE" 2>/dev/null || sudo journalctl | grep -i "$UNIT" > "$OUTFILE" || true
         echo "✅ Saved to $OUTFILE"
         read -p "⏎ Press Enter to continue..." _
         ;;
@@ -126,27 +84,3 @@ view_logs() {
     esac
   done
 }
-
-uninstall_bot() {
-  echo "❌ Uninstalling the bot completely..."
-  systemctl stop "$SERVICE_NAME"
-  systemctl disable "$SERVICE_NAME"
-  rm -f /etc/systemd/system/"$SERVICE_NAME".service
-  systemctl daemon-reload
-  rm -rf "$INSTALL_DIR"
-  echo "✅ Bot and all files have been removed."
-  read -p "⏎ Press Enter to return to the menu..." _
-}
-
-while true; do
-  show_menu
-  case $choice in
-    1) install_bot ;;
-    2) configure_bot ;;
-    3) update_bot ;;
-    4) uninstall_bot ;;
-    5) view_logs ;;
-    0) echo "👋 Exiting. Goodbye!"; exit 0 ;;
-    *) echo "❌ Invalid option. Please choose a valid one."; sleep 2 ;;
-  esac
-done
