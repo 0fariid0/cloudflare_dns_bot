@@ -7,21 +7,35 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters)
 
-# --- START: Mock API and Config (برای تست) ---
-# این بخش را با فایل‌های اصلی خود جایگزین کنید یا مقادیر صحیح را وارد نمایید
 try:
     from cloudflare_api import *
     from config import BOT_TOKEN, ADMIN_ID
 except ImportError:
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # << توکن ربات خود را اینجا وارد کنید
-    ADMIN_ID = 123456789             # << شناسه عددی ادمین اصلی را اینجا وارد کنید
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    ADMIN_ID = 123456789
     MOCKED_ZONES = {
         "zone1": {"id": "zone1", "name": "example.com", "status": "active"},
-        "zone2": {"id": "zone2", "name": "mysite.org", "status": "active"}
+        "zone2": {"id": "zone2", "name": "mysite.org", "status": "active"},
+        "zone3": {"id": "zone3", "name": "anothersite.net", "status": "pending"}
+    }
+    MOCKED_RECORDS = {
+        "zone1": [
+            {"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1"},
+            {"id": "rec2", "type": "CNAME", "name": "www.example.com", "content": "example.com"},
+            {"id": "rec3", "type": "MX", "name": "example.com", "content": "mail.example.com"},
+        ],
+        "zone2": [
+            {"id": "rec4", "type": "AAAA", "name": "ipv6.mysite.org", "content": "2001:db8::1"}
+        ],
+         "zone3": []
     }
     def get_zones(): return list(MOCKED_ZONES.values())
-    def get_dns_records(zone_id): return [{"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1"}]
-    def get_record_details(zone_id, record_id): return {"id": "rec1", "name": "test.example.com", "type": "A", "content": "1.1.1.1", "ttl": 1, "proxied": True}
+    def get_dns_records(zone_id): return MOCKED_RECORDS.get(zone_id, [])
+    def get_record_details(zone_id, record_id):
+        for rec in MOCKED_RECORDS.get(zone_id, []):
+            if rec["id"] == record_id:
+                return {**rec, "ttl": 1, "proxied": True}
+        return None
     def get_zone_info_by_id(zone_id): return MOCKED_ZONES.get(zone_id)
     def create_dns_record(zone_id, type, name, content, ttl, proxied): return True
     def update_dns_record(zone_id, record_id, name, type, content, ttl, proxied): return True
@@ -32,13 +46,10 @@ except ImportError:
             del MOCKED_ZONES[zone_id]
             return True
         return False
-# --- END: Mock API and Config ---
 
-# --- Setup ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- File Paths ---
 USER_FILE = "users.json"
 LOG_FILE = "bot_audit.log"
 BLOCKED_USER_FILE = "blocked_users.json"
@@ -49,7 +60,6 @@ user_state = defaultdict(dict)
 class State(Enum):
     NONE, ADDING_USER, ADDING_RECORD_NAME, ADDING_RECORD_CONTENT, EDITING_IP, EDITING_TTL, CLONING_NEW_IP = auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
-# --- START: Data Management Functions ---
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] User: {user_id} | Action: {action}\n"
@@ -70,22 +80,46 @@ def save_data(filename, data):
         json.dump(data, f, indent=4)
 
 def load_users():
-    users = load_data(USER_FILE, {"authorized_ids": []})
-    if ADMIN_ID not in users["authorized_ids"]:
-        users["authorized_ids"].append(ADMIN_ID)
-        save_data(USER_FILE, users)
-    return users["authorized_ids"]
+    data = load_data(USER_FILE, {"users": {}})
+    if isinstance(data, dict) and "authorized_ids" in data:
+        migrated_users = {str(uid): {"access": []} for uid in data["authorized_ids"] if uid != ADMIN_ID}
+        migrated_users[str(ADMIN_ID)] = {"access": "all"}
+        data = {"users": migrated_users}
+        save_data(USER_FILE, data)
+    
+    admin_id_str = str(ADMIN_ID)
+    if admin_id_str not in data.get("users", {}):
+        data.setdefault("users", {})[admin_id_str] = {"access": "all"}
+        save_data(USER_FILE, data)
+    return data["users"]
 
-def save_users(user_list):
-    save_data(USER_FILE, {"authorized_ids": sorted(list(set(user_list)))})
+def save_users(users_dict):
+    save_data(USER_FILE, {"users": users_dict})
 
 def is_user_authorized(user_id):
-    return user_id in load_users()
+    users = load_users()
+    return str(user_id) in users
+
+def get_user_accessible_zones(user_id):
+    users = load_users()
+    user_id_str = str(user_id)
+    user_data = users.get(user_id_str)
+
+    if not user_data:
+        return []
+
+    all_zones = get_zones()
+    if user_data.get("access") == "all":
+        return all_zones
+    
+    accessible_zone_ids = user_data.get("access", [])
+    return [zone for zone in all_zones if zone["id"] in accessible_zone_ids]
 
 def add_user(user_id):
     users = load_users()
-    if user_id not in users:
-        users.append(user_id)
+    user_id_str = str(user_id)
+    if user_id_str not in users:
+        users[user_id_str] = {"access": []}
         save_users(users)
         unblock_user(user_id)
         return True
@@ -94,8 +128,9 @@ def add_user(user_id):
 def remove_user(user_id):
     if user_id == ADMIN_ID: return False
     users = load_users()
-    if user_id in users:
-        users.remove(user_id)
+    user_id_str = str(user_id)
+    if user_id_str in users:
+        del users[user_id_str]
         save_users(users)
         return True
     return False
@@ -150,7 +185,6 @@ def remove_request(user_id: int):
         save_requests(requests)
         return True
     return False
-# --- END: Data Management Functions ---
 
 def reset_user_state(uid, keep_zone=False):
     current_state = user_state.get(uid, {})
@@ -161,22 +195,24 @@ def reset_user_state(uid, keep_zone=False):
     else:
         user_state.pop(uid, None)
 
-# --- START: UI and Menu Functions ---
-
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reset_user_state(user_id)
     try:
-        zones = get_zones()
+        zones = get_user_accessible_zones(user_id)
     except Exception as e:
-        logger.error(f"Could not fetch zones: {e}")
+        logger.error(f"Could not fetch zones for user {user_id}: {e}")
         await update.effective_message.reply_text("❌ خطا در ارتباط با Cloudflare.")
         return
 
     keyboard = []
-    for zone in zones:
-        status_icon = "✅" if zone["status"] == "active" else "⏳"
-        keyboard.append([InlineKeyboardButton(f"{zone['name']} {status_icon}", callback_data=f"zone_{zone['id']}")])
+    if not zones:
+        welcome_text = "شما به هیچ دامنه‌ای دسترسی ندارید. لطفاً با مدیر تماس بگیرید."
+    else:
+        welcome_text = "👋 به ربات مدیریت DNS خوش آمدید!\n\n🌐 برای مدیریت رکوردها، دامنه خود را انتخاب کنید:"
+        for zone in zones:
+            status_icon = "✅" if zone["status"] == "active" else "⏳"
+            keyboard.append([InlineKeyboardButton(f"{zone['name']} {status_icon}", callback_data=f"zone_{zone['id']}")])
     
     action_buttons = [InlineKeyboardButton("🔄 رفرش", callback_data="refresh_domains")]
     if user_id == ADMIN_ID:
@@ -190,7 +226,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i in range(0, len(action_buttons), 2):
         keyboard.append(action_buttons[i:i + 2])
 
-    welcome_text = "👋 به ربات مدیریت DNS خوش آمدید!\n\n🌐 برای مدیریت رکوردها، دامنه خود را انتخاب کنید:"
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
@@ -205,19 +240,25 @@ async def manage_users_main_menu(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("📨 درخواست‌های در انتظار", callback_data="manage_requests")],
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]
     ]
-    await update.effective_message.edit_text(" لطفا بخش مورد نظر برای مدیریت کاربران را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.effective_message.edit_text("لطفا بخش مورد نظر برای مدیریت کاربران را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def manage_whitelist_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
     keyboard = []
     text = "👤 *لیست کاربران مجاز (Whitelist):*\n\n"
-    for uid in users:
-        user_text = f"`{uid}`" + (" (ادمین اصلی)" if uid == ADMIN_ID else "")
+    for uid_str, u_data in users.items():
+        uid = int(uid_str)
+        user_text = f"`{uid}`"
+        if uid == ADMIN_ID:
+            user_text += " (ادمین اصلی)"
+        
         buttons = []
         if uid != ADMIN_ID:
             buttons.extend([
+                InlineKeyboardButton("🔑 دسترسی‌ها", callback_data=f"manage_access_{uid}"),
                 InlineKeyboardButton("🗑 حذف", callback_data=f"delete_user_{uid}"),
-                InlineKeyboardButton("🚫 بلاک", callback_data=f"block_user_{uid}")])
+                InlineKeyboardButton("🚫 بلاک", callback_data=f"block_user_{uid}")
+            ])
         keyboard.append([InlineKeyboardButton(user_text, callback_data="noop")] + buttons)
     
     keyboard.append([InlineKeyboardButton("➕ افزودن کاربر جدید", callback_data="add_user_prompt")])
@@ -228,6 +269,25 @@ async def manage_whitelist_menu(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.effective_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+async def manage_user_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    target_user_id = int(query.data.split('_')[2])
+    all_zones = get_zones()
+    users = load_users()
+    user_access = users.get(str(target_user_id), {}).get("access", [])
+
+    text = f"🔑 *مدیریت دسترسی برای کاربر `{target_user_id}`*\n\n"
+    keyboard = []
+    for zone in all_zones:
+        has_access = zone['id'] in user_access
+        status_icon = "✅" if has_access else "❌"
+        button_text = f"{status_icon} {zone['name']}"
+        callback_data = f"toggle_access_{target_user_id}_{zone['id']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت به لیست کاربران", callback_data="manage_whitelist")])
+    await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def manage_blacklist_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked_users = load_blocked_users()
@@ -265,7 +325,7 @@ async def show_delete_domain_menu(update: Update, context: ContextTypes.DEFAULT_
         return
     keyboard = [[InlineKeyboardButton(f"🗑️ {z['name']}", callback_data=f"confirm_delete_zone_{z['id']}")] for z in zones]
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back_to_main")])
-    text = " لطفا دامنه‌ای که قصد حذف آن را دارید انتخاب کنید.\n\n**توجه:** این عمل غیرقابل بازگشت است!"
+    text = "لطفا دامنه‌ای که قصد حذف آن را دارید انتخاب کنید.\n\n**توجه:** این عمل غیرقابل بازگشت است!"
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,10 +337,11 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     records = get_dns_records(zone_id)
     text = f"📋 رکوردهای DNS دامنه: `{zone_name}`\n\n"
     keyboard = []
+    supported_types = ["A", "AAAA", "CNAME", "TXT", "MX", "SRV"]
     for rec in records:
-        if rec["type"] in ["A", "AAAA", "CNAME"]:
+        if rec["type"] in supported_types:
             name = rec["name"].replace(f".{zone_name}", "").replace(zone_name, "@")
-            keyboard.append([InlineKeyboardButton(name, callback_data="noop"), InlineKeyboardButton(f"{rec['content']} | ⚙️", callback_data=f"record_settings_{rec['id']}")])
+            keyboard.append([InlineKeyboardButton(f"{rec['type']} | {name}", callback_data="noop"), InlineKeyboardButton(f"{rec['content']} | ⚙️", callback_data=f"record_settings_{rec['id']}")])
     keyboard.extend([
         [InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record")],
         [InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")],
@@ -299,8 +360,8 @@ async def show_record_settings(message, uid, zone_id, record_id):
         return
     user_state[uid]["record_id"] = record_id
     proxied_status = '✅ فعال' if record.get('proxied') else '❌ غیرفعال'
-    text = f"⚙️ تنظیمات رکورد: `{record['name']}`\n\n**Type:** `{record['type']}`\n**IP:** `{record['content']}`\n**TTL:** `{record['ttl']}`\n**Proxied:** {proxied_status}"
-    keyboard = [[InlineKeyboardButton("🖊 تغییر IP", callback_data=f"editip_{record_id}"), InlineKeyboardButton("🕒 تغییر TTL", callback_data=f"edittll_{record_id}")],
+    text = f"⚙️ تنظیمات رکورد: `{record['name']}`\n\n**Type:** `{record['type']}`\n**Content:** `{record['content']}`\n**TTL:** `{record['ttl']}`\n**Proxied:** {proxied_status}"
+    keyboard = [[InlineKeyboardButton("🖊 تغییر IP/Content", callback_data=f"editip_{record_id}"), InlineKeyboardButton("🕒 تغییر TTL", callback_data=f"edittll_{record_id}")],
                 [InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")]]
     action_row = []
     if record['type'] == 'A': action_row.append(InlineKeyboardButton("🐑 کلون", callback_data=f"clone_record_{record_id}"))
@@ -310,7 +371,7 @@ async def show_record_settings(message, uid, zone_id, record_id):
     await message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = "متن راهنمای شما در اینجا قرار می‌گیرد..."
+    help_text = "این ربات برای مدیریت رکوردهای DNS در Cloudflare طراحی شده است. می‌توانید دامنه‌های خود را مشاهده کرده، رکوردهای آن‌ها را مدیریت (افزودن، ویرایش، حذف) کنید. ادمین اصلی قابلیت مدیریت کاربران و دسترسی آن‌ها به دامنه‌های مختلف را دارد."
     await update.effective_message.edit_text(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]))
 
 async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,9 +401,7 @@ async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.edit_text(formatted_log, parse_mode="Markdown", reply_markup=reply_markup)
     else:
         await update.effective_message.reply_text(formatted_log, parse_mode="Markdown", reply_markup=reply_markup)
-# --- END: UI and Menu Functions ---
 
-# --- START: Access Request Flow ---
 async def show_request_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("✉️ ارسال درخواست دسترسی", callback_data="request_access")]]
     text = "❌ شما به این ربات دسترسی ندارید. برای ارسال درخواست به مدیر، دکمه زیر را فشار دهید."
@@ -366,9 +425,7 @@ async def handle_unauthorized_access_request(update: Update, context: ContextTyp
         await query.edit_message_text("✅ درخواست شما با موفقیت ثبت شد. مدیر به زودی آن را بررسی خواهد کرد.")
     else:
         await query.answer("⚠️ شما قبلاً یک درخواست ارسال کرده‌اید. لطفاً منتظر بمانید.", show_alert=True)
-# --- END: Access Request Flow ---
 
-# --- START: Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_user_blocked(user_id): return
@@ -420,15 +477,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_records_list(update, context)
 
     elif mode == State.EDITING_IP:
-        new_ip = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
-        await update.message.reply_text(f"⏳ در حال به‌روزرسانی IP...", parse_mode="Markdown")
+        new_content = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
+        await update.message.reply_text(f"⏳ در حال به‌روزرسانی محتوا...", parse_mode="Markdown")
         try:
             record = get_record_details(zone_id, record_id)
             if record:
-                if update_dns_record(zone_id, record_id, record["name"], record["type"], new_ip, record["ttl"], record.get("proxied", False)):
-                    log_action(uid, f"UPDATE IP for '{record['name']}' to '{new_ip}'")
-                    await update.message.reply_text("✅ آی‌پی با موفقیت به‌روز شد.")
+                if update_dns_record(zone_id, record_id, record["name"], record["type"], new_content, record["ttl"], record.get("proxied", False)):
+                    log_action(uid, f"UPDATE Content for '{record['name']}' to '{new_content}'")
+                    await update.message.reply_text("✅ محتوای رکورد با موفقیت به‌روز شد.")
                     new_msg = await update.message.reply_text("...در حال بارگذاری تنظیمات جدید")
+                    reset_user_state(uid, keep_zone=True)
                     await show_record_settings(new_msg, uid, zone_id, record_id)
                 else: 
                     await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
@@ -446,12 +504,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif mode == State.ADDING_RECORD_NAME:
         user_state[uid]["record_data"]["name"] = text
         user_state[uid]["mode"] = State.ADDING_RECORD_CONTENT
-        await update.message.reply_text("📌 مرحله ۳ از ۵: مقدار رکورد را وارد کنید (مثلاً IP):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
+        await update.message.reply_text("📌 مرحله ۳ از ۵: مقدار رکورد را وارد کنید (مثلاً IP یا آدرس):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     
     elif mode == State.ADDING_RECORD_CONTENT:
         user_state[uid]["record_data"]["content"] = text
         user_state[uid].pop("mode", None)
-        keyboard = [[InlineKeyboardButton("Auto", callback_data="select_ttl_1"), InlineKeyboardButton("1 دقیقه", callback_data="select_ttl_60")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]
+        keyboard = [
+            [InlineKeyboardButton("Auto", callback_data="select_ttl_1"), InlineKeyboardButton("2 min", callback_data="select_ttl_120")],
+            [InlineKeyboardButton("5 min", callback_data="select_ttl_300"), InlineKeyboardButton("10 min", callback_data="select_ttl_600")],
+            [InlineKeyboardButton("1 hr", callback_data="select_ttl_3600"), InlineKeyboardButton("1 day", callback_data="select_ttl_86400")],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ]
         await update.message.reply_text("📌 مرحله ۴ از ۵: مقدار TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,13 +531,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_request_access_menu(update, context)
         return
         
-    if data.startswith(('manage_', 'delete_user_', 'block_user_', 'unblock_user_', 'access_', 'add_user_prompt')):
+    if data.startswith(('manage_', 'delete_user_', 'block_user_', 'unblock_user_', 'access_', 'add_user_prompt', 'toggle_access_')):
         if uid != ADMIN_ID:
             await query.answer("شما اجازه دسترسی به این بخش را ندارید.", show_alert=True); return
         if data == "manage_users": await manage_users_main_menu(update, context)
         elif data == "manage_whitelist": await manage_whitelist_menu(update, context)
         elif data == "manage_blacklist": await manage_blacklist_menu(update, context)
         elif data == "manage_requests": await manage_requests_menu(update, context)
+        elif data.startswith("manage_access_"): await manage_user_access_menu(update, context)
+        elif data.startswith("toggle_access_"):
+            parts = data.split('_')
+            target_user_id_str, zone_id_to_toggle = parts[2], parts[3]
+            users = load_users()
+            user_data = users.get(target_user_id_str)
+            if user_data and user_data.get("access") != "all":
+                access_list = user_data.get("access", [])
+                if zone_id_to_toggle in access_list:
+                    access_list.remove(zone_id_to_toggle)
+                    log_action(uid, f"Revoked access to zone {zone_id_to_toggle} for user {target_user_id_str}")
+                else:
+                    access_list.append(zone_id_to_toggle)
+                    log_action(uid, f"Granted access to zone {zone_id_to_toggle} for user {target_user_id_str}")
+                users[target_user_id_str]["access"] = access_list
+                save_users(users)
+                await manage_user_access_menu(update, context)
         elif data.startswith("delete_user_"):
             user_to_manage = int(data.split("_")[2])
             if remove_user(user_to_manage): log_action(uid, f"Removed user {user_to_manage}."); await query.answer("کاربر از لیست مجاز حذف شد.")
@@ -494,7 +574,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action, target_user_id = data.split("_")[1], int(data.split("_")[2])
             if action == "approve":
                 add_user(target_user_id); log_action(uid, f"Approved access for {target_user_id}.")
-                await context.bot.send_message(chat_id=target_user_id, text="✅ درخواست دسترسی شما توسط مدیر تایید شد."); await query.answer("دسترسی تایید شد.")
+                await context.bot.send_message(chat_id=target_user_id, text="✅ درخواست دسترسی شما توسط مدیر تایید شد. برای شروع /start را بزنید."); await query.answer("دسترسی تایید شد.")
             elif action == "reject":
                 log_action(uid, f"Rejected access for {target_user_id}.")
                 await context.bot.send_message(chat_id=target_user_id, text="❌ درخواست دسترسی شما توسط مدیر رد شد."); await query.answer("درخواست رد شد.")
@@ -536,9 +616,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("editip_"):
         record_id = data.split("_")[-1]
         user_state[uid].update({"mode": State.EDITING_IP, "record_id": record_id})
-        await query.message.edit_text("📝 لطفاً IP جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
+        await query.message.edit_text("📝 لطفاً IP/Content جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("edittll_"):
-        record_id = data.split("_")[-1]; keyboard = [[InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("1 دقیقه", callback_data=f"update_ttl_{record_id}_60")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]
+        record_id = data.split("_")[-1]
+        keyboard = [
+            [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("2 min", callback_data=f"update_ttl_{record_id}_120")],
+            [InlineKeyboardButton("5 min", callback_data=f"update_ttl_{record_id}_300"), InlineKeyboardButton("10 min", callback_data=f"update_ttl_{record_id}_600")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_{record_id}_86400")],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ]
         await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("update_ttl_"):
         parts, record_id, ttl = data.split("_"), data.split("_")[2], int(data.split("_")[3])
@@ -547,14 +633,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_action(uid, f"Updated TTL for '{record['name']}' to {ttl}"); await query.answer("✅ TTL تغییر یافت."); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.")
     elif data == "add_record":
-        user_state[uid]["record_data"] = {}; keyboard = [[InlineKeyboardButton("A", callback_data="select_type_A"), InlineKeyboardButton("CNAME", callback_data="select_type_CNAME")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]
+        user_state[uid]["record_data"] = {}
+        keyboard = [
+            [InlineKeyboardButton("A", callback_data="select_type_A"), InlineKeyboardButton("AAAA", callback_data="select_type_AAAA")],
+            [InlineKeyboardButton("CNAME", callback_data="select_type_CNAME"), InlineKeyboardButton("TXT", callback_data="select_type_TXT")],
+            [InlineKeyboardButton("MX", callback_data="select_type_MX"), InlineKeyboardButton("SRV", callback_data="select_type_SRV")],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
+        ]
         await query.message.edit_text("📌 مرحله ۱ از ۵: نوع رکورد را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("select_type_"):
         user_state[uid]["record_data"]["type"] = data.split("_")[2]; user_state[uid]["mode"] = State.ADDING_RECORD_NAME
         await query.message.edit_text("📌 مرحله ۲ از ۵: نام رکورد را وارد کنید (مثال: sub یا @):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("select_ttl_"):
         user_state[uid]["record_data"]["ttl"] = int(data.split("_")[2]); keyboard = [[InlineKeyboardButton("✅ بله", callback_data="select_proxied_true"), InlineKeyboardButton("❌ خیر", callback_data="select_proxied_false")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]
-        await query.message.edit_text("📌 مرحله ۵ از ۵: آیا پروکسی فعال باشد؟", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.edit_text("📌 مرحله ۵ از ۵: آیا پروکسی فعال باشد؟ (فقط برای رکوردهای A, AAAA, CNAME اعمال می‌شود)", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("select_proxied_"):
         user_state[uid]["record_data"]["proxied"] = data.endswith("true")
         r_data, zone_name = user_state[uid]["record_data"], state["zone_name"]
@@ -580,7 +672,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
     elif data.startswith("delete_record_"):
         record_id = data.split("_")[-1]; 
-        # --- FIXED: Get record details BEFORE deleting to log its content ---
         record_details = get_record_details(zone_id, record_id)
         await query.message.edit_text("⏳ در حال حذف رکورد...")
         if delete_dns_record(zone_id, record_id):
@@ -592,7 +683,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else: await query.message.edit_text("❌ حذف رکورد ناموفق بود.")
         await show_records_list(update, context)
 
-# --- Main Application ---
 def main():
     load_users(); load_blocked_users(); load_requests()
     logger.info("Starting bot...")
