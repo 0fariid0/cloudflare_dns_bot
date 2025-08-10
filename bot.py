@@ -358,8 +358,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = ["id,type,name,content,ttl,proxied"]
             for r in records:
                 lines.append(f"{r['id']},{r['type']},{r['name']},{r['content']},{r.get('ttl','')},{r.get('proxied',False)}")
-            csv_text = "
-".join(lines)
+            csv_text = "\n".join(lines)
             if len(csv_text) > 3000:
                 await query.message.reply_text("✅ خروجی CSV آماده است — بیش از حد بزرگ برای پیام. لطفاً از روش دیگری برای دریافت فایل استفاده کنید.")
             else:
