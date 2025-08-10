@@ -2,6 +2,8 @@
 
 INSTALL_DIR="/root/cloudflare_dns_bot"
 SERVICE_NAME="cloudflarebot"
+LOG_DIR="$INSTALL_DIR/logs"
+
 # At the very beginning of setup.sh
 if [ -d "$INSTALL_DIR/.git" ]; then
   cd "$INSTALL_DIR" || exit
@@ -20,11 +22,11 @@ show_menu() {
   echo "2) ⚙️  Configure the bot"
   echo "3) 🔄 Update the bot"
   echo "4) ❌ Uninstall the bot"
+  echo "5) 📜 View logs"
   echo "0) 🚪 Exit"
   echo ""
   read -p "Your choice: " choice
 }
-
 
 install_bot() {
   echo "📦 Installing the bot..."
@@ -67,6 +69,64 @@ update_bot() {
   read -p "⏎ Press Enter to return to the menu..." _
 }
 
+view_logs() {
+  # make sure log dir exists (for saved exports)
+  mkdir -p "$LOG_DIR"
+
+  if ! systemctl status "$SERVICE_NAME" >/dev/null 2>&1; then
+    echo "⚠️ سرویس $SERVICE_NAME پیدا نشد یا فعال نیست."
+    read -p "⏎ Press Enter to return to the menu..." _
+    return
+  fi
+
+  while true; do
+    clear
+    echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+    echo "┃      View logs for $SERVICE_NAME     ┃"
+    echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+    echo "1) 📄 Show last 200 lines"
+    echo "2) ▶️ Follow live (journalctl -f)"
+    echo "3) 🔎 Open with less (paged)"
+    echo "4) 💾 Save last 1000 lines to file"
+    echo "0) 🔙 Back to main menu"
+    echo ""
+    read -p "Choose: " lchoice
+
+    case $lchoice in
+      1)
+        echo "----- Last 200 lines -----"
+        journalctl -u "$SERVICE_NAME" -n 200 --no-pager
+        echo "--------------------------"
+        read -p "⏎ Press Enter to continue..." _
+        ;;
+      2)
+        echo "----- Following logs (Ctrl+C to stop) -----"
+        journalctl -u "$SERVICE_NAME" -f
+        # when user Ctrl+C, they'll return here
+        ;;
+      3)
+        # pipe to less for paging
+        journalctl -u "$SERVICE_NAME" | less
+        ;;
+      4)
+        TIMESTAMP=$(date +"%F_%H%M%S")
+        OUTFILE="$LOG_DIR/${SERVICE_NAME}_logs_${TIMESTAMP}.log"
+        echo "Saving last 1000 lines to $OUTFILE ..."
+        journalctl -u "$SERVICE_NAME" -n 1000 --no-pager > "$OUTFILE"
+        echo "✅ Saved to $OUTFILE"
+        read -p "⏎ Press Enter to continue..." _
+        ;;
+      0)
+        break
+        ;;
+      *)
+        echo "❌ Invalid option"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 uninstall_bot() {
   echo "❌ Uninstalling the bot completely..."
   systemctl stop "$SERVICE_NAME"
@@ -85,6 +145,7 @@ while true; do
     2) configure_bot ;;
     3) update_bot ;;
     4) uninstall_bot ;;
+    5) view_logs ;;
     0) echo "👋 Exiting. Goodbye!"; exit 0 ;;
     *) echo "❌ Invalid option. Please choose a valid one."; sleep 2 ;;
   esac
