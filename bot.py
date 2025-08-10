@@ -22,7 +22,6 @@ except ImportError:
         "zone1": [
             {"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1"},
             {"id": "rec2", "type": "CNAME", "name": "www.example.com", "content": "example.com"},
-            {"id": "rec3", "type": "MX", "name": "example.com", "content": "mail.example.com"},
         ],
         "zone2": [
             {"id": "rec4", "type": "AAAA", "name": "ipv6.mysite.org", "content": "2001:db8::1"}
@@ -337,7 +336,7 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     records = get_dns_records(zone_id)
     text = f"📋 رکوردهای DNS دامنه: `{zone_name}`\n\n"
     keyboard = []
-    supported_types = ["A", "AAAA", "CNAME", "TXT", "MX", "SRV"]
+    supported_types = ["A", "AAAA", "CNAME"]
     for rec in records:
         if rec["type"] in supported_types:
             name = rec["name"].replace(f".{zone_name}", "").replace(zone_name, "@")
@@ -636,8 +635,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[uid]["record_data"] = {}
         keyboard = [
             [InlineKeyboardButton("A", callback_data="select_type_A"), InlineKeyboardButton("AAAA", callback_data="select_type_AAAA")],
-            [InlineKeyboardButton("CNAME", callback_data="select_type_CNAME"), InlineKeyboardButton("TXT", callback_data="select_type_TXT")],
-            [InlineKeyboardButton("MX", callback_data="select_type_MX"), InlineKeyboardButton("SRV", callback_data="select_type_SRV")],
+            [InlineKeyboardButton("CNAME", callback_data="select_type_CNAME")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await query.message.edit_text("📌 مرحله ۱ از ۵: نوع رکورد را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
