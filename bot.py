@@ -6,6 +6,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters)
 from unittest.mock import Mock
 
+# فرض می‌شود این فایل‌ها در کنار bot.py وجود دارند
 from cloudflare_api import *
 from config import BOT_TOKEN, ADMIN_ID
 
@@ -138,7 +139,7 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.extend([
         [InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record")],
         [InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")],
-        [InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_domains")]
+        [InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_main")]
     ])
     
     await update.effective_message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -170,7 +171,7 @@ async def show_record_settings(message, uid, zone_id, record_id):
             InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")
         ],
         [
-            InlineKeyboardButton("🗑 حذف", callback_data=f"confirm_delete_{record_id}"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"confirm_delete_record_{record_id}"),
             InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_records")
         ]
     ]
@@ -196,6 +197,57 @@ async def manage_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+🤖 *راهنمای ربات مدیریت Cloudflare DNS*
+
+این ربات به شما اجازه می‌دهد تا دامنه‌ها و رکوردهای DNS خود را در حساب Cloudflare به راحتی مدیریت کنید.
+
+---
+### **بخش ۱: مدیریت دامنه‌ها**
+
+-   *نمایش دامنه‌ها:* در منوی اصلی، لیست تمام دامنه‌های شما نمایش داده می‌شود.
+-   *افزودن دامنه:* با زدن دکمه `➕ افزودن دامنه`، می‌توانید نام دامنه جدیدی (مثلاً `example.com`) را وارد کنید. پس از افزودن، باید **Name Server** های دامنه خود را به مواردی که ربات اعلام می‌کند تغییر دهید.
+-   *حذف دامنه:* با زدن دکمه `🗑` کنار هر دامنه، می‌توانید آن را از حساب Cloudflare خود حذف کنید. (این عمل غیرقابل بازگشت است!)
+
+---
+### **بخش ۲: مدیریت رکوردها**
+
+برای مدیریت رکوردهای یک دامنه، کافیست روی نام آن در لیست کلیک کنید.
+
+-   *افزودن رکورد:*
+    1.  دکمه `➕ افزودن رکورد` را بزنید.
+    2.  **نوع رکورد** را انتخاب کنید (`A`, `AAAA`, `CNAME`).
+    3.  **نام رکورد** را وارد کنید. برای دامنه اصلی (root)، از علامت `@` استفاده کنید. برای ساب‌دامین، نام آن را وارد کنید (مثلاً `sub`).
+    4.  **مقدار رکورد** را وارد کنید (مثلاً آدرس IP برای رکورد `A` یا یک دامنه دیگر برای `CNAME`).
+    5.  **TTL** (Time To Live) را انتخاب کنید. مقدار `Auto` توصیه می‌شود.
+    6.  **وضعیت پروکسی** را مشخص کنید. فعال بودن پروکسی (`✅`) باعث می‌شود ترافیک شما از طریق Cloudflare عبور کرده و IP اصلی سرور شما مخفی بماند.
+
+-   *ویرایش رکورد:*
+    -   با کلیک بر روی دکمه `⚙️` کنار هر رکورد، وارد تنظیمات آن می‌شوید.
+    -   *تغییر IP:* برای به‌روزرسانی آدرس IP رکورد.
+    -   *تغییر TTL:* برای تغییر زمان کش شدن اطلاعات DNS.
+    -   *پروکسی:* برای فعال/غیرفعال کردن پروکسی Cloudflare.
+
+-   *حذف رکورد:* در منوی تنظیمات هر رکورد، با زدن دکمه `🗑 حذف` می‌توانید آن را پاک کنید.
+
+---
+### **بخش ۳: مدیریت کاربران (ویژه ادمین)**
+
+-   ادمین اصلی ربات می‌تواند با مراجعه به بخش `👥 مدیریت کاربران`، کاربران جدیدی را برای استفاده از ربات مجاز کند یا کاربران موجود را حذف نماید.
+-   برای افزودن کاربر، به **شناسه عددی (ID)** او نیاز دارید. کاربر می‌تواند با ارسال پیام به ربات @userinfobot شناسه خود را دریافت کند.
+
+---
+برای بازگشت به منوی قبل از دکمه‌های `🔙 بازگشت` و برای لغو عملیات از دکمه `❌ لغو` استفاده کنید.
+    """
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]]
+    await update.effective_message.edit_text(
+        help_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
 # --- Command and Callback Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(update.effective_user.id):
@@ -217,10 +269,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zone_id = state.get("zone_id")
 
     # Navigation
-    if data in ["back_to_domains", "refresh_domains", "back_to_main"]:
+    if data in ["back_to_main", "refresh_domains"]:
         await show_main_menu(update, context)
     elif data == "back_to_records" or data == "refresh_records":
         await show_records_list(update, context)
+    elif data == "show_help":
+        await show_help(update, context)
     elif data == "cancel_action":
         reset_user_state(uid, keep_zone=True)
         await query.message.edit_text("❌ عملیات لغو شد.")
@@ -272,7 +326,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # TTL Editing
     elif data.startswith("edittll_"):
-        record_id = data.split("_")[2] # Corrected from _[1]
+        record_id = data.split("_")[2]
         user_state[uid].update({"mode": State.EDITING_TTL, "record_id": record_id})
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("1 دقیقه", callback_data=f"update_ttl_{record_id}_60")],
@@ -337,11 +391,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Deletion Confirmation
     elif data.startswith("confirm_delete_"):
-        item_type, item_id = data.split("_")[2], data.split("_")[3]
+        item_type = "record" if data.startswith("confirm_delete_record_") else "zone"
+        item_id = data.split("_")[-1]
         text = f"❗ آیا از حذف این {'رکورد' if item_type == 'record' else 'دامنه'} مطمئن هستید؟"
+        back_action = "back_to_records" if item_type == 'record' else 'back_to_main'
         keyboard = [
             [InlineKeyboardButton("✅ بله، حذف شود", callback_data=f"delete_{item_type}_{item_id}")],
-            [InlineKeyboardButton("❌ لغو", callback_data="back_to_records" if item_type == 'record' else 'back_to_domains')]
+            [InlineKeyboardButton("❌ لغو", callback_data=back_action)]
         ]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
