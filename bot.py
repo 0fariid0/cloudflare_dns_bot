@@ -1,5 +1,7 @@
 import logging
 import json
+import io
+import csv
 from collections import defaultdict
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters)
@@ -28,14 +30,17 @@ def load_users():
         save_users([ADMIN_ID])
         return [ADMIN_ID]
 
+
 def save_users(users_list):
     """لیست کاربران را در فایل JSON ذخیره می‌کند."""
     with open(USER_FILE, 'w') as f:
         json.dump({"authorized_ids": sorted(list(set(users_list)))}, f, indent=4)
 
+
 def is_user_authorized(user_id):
     """بررسی می‌کند آیا کاربر در لیست مجاز قرار دارد یا خیر."""
     return user_id in load_users()
+
 
 def add_user(user_id):
     """کاربر جدید را به لیست اضافه می‌کند."""
@@ -45,6 +50,7 @@ def add_user(user_id):
         save_users(users)
         return True
     return False
+
 
 def remove_user(user_id):
     """کاربر را از لیست حذف می‌کند. ادمین اصلی قابل حذف نیست."""
@@ -56,6 +62,7 @@ def remove_user(user_id):
         save_users(users)
         return True
     return False
+
 
 def reset_user_state(uid, keep_zone=False):
     """وضعیت کاربر را ریست می‌کند."""
@@ -96,7 +103,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("👥 مدیریت کاربران", callback_data="manage_users")])
     keyboard.append([InlineKeyboardButton("ℹ️ راهنما", callback_data="show_help")])
 
-    welcome_text = "👋 به ربات مدیریت DNS خوش آمدید!\n\n🌐 دامنه‌های متصل:"
+    welcome_text = "👋 به ربات مدیریت DNS خوش آمدید!
+
+🌐 دامنه‌های متصل:"
     message = update.message or update.callback_query.message
     if update.callback_query:
         await message.edit_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -109,7 +118,9 @@ async def manage_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.callback_query.message
     users = load_users()
     keyboard = []
-    text = "👥 *لیست کاربران مجاز:*\n\n"
+    text = "👥 *لیست کاربران مجاز:*
+
+"
     for user_id in users:
         user_text = f"👤 `{user_id}`"
         buttons = []
@@ -131,42 +142,121 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def refresh_records(uid, update: Update, page=0):
-    # This function is complete
+    """بارگذاری و نمایش رکوردها با pagination مدرن‌تر، مقاوم و سازگار با ورژن اصلی کد.
+
+    این تابع فقط مسئول ساخت متن و کیبورد و ارسال/ویرایش پیام است.
+    """
+    # اطمینان از اینکه zone_id موجود است
+    if uid not in user_state or "zone_id" not in user_state[uid]:
+        # پیام‌دهی ساده و برگشت به منوی اصلی
+        try:
+            await (update.callback_query.message or update.message).reply_text("⚠️ ابتدا یک دامنه انتخاب کنید.")
+        except Exception:
+            logger.warning("No message to reply to when zone not set")
+        return
+
     zone_id = user_state[uid]["zone_id"]
     zone_name = user_state[uid].get("zone_name", "")
+
     try:
-        records = get_dns_records(zone_id)
+        records = get_dns_records(zone_id) or []
     except Exception as e:
-        logger.error(f"Could not fetch records for zone {zone_id}: {e}")
-        await update.callback_query.message.reply_text("❌ خطا در دریافت لیست رکوردها.")
+        logger.exception("Could not fetch records")
+        try:
+            await (update.callback_query.message or update.message).reply_text("❌ خطا در دریافت لیست رکوردها.")
+        except Exception:
+            logger.exception("Failed to notify user about fetch error")
         return
+
+    total_records = len(records)
+    total_pages = 0 if total_records == 0 else (total_records - 1) // RECORDS_PER_PAGE + 1
+
+    # clamp page
+    if page < 0:
+        page = 0
+    if total_pages > 0 and page > total_pages - 1:
+        page = total_pages - 1
+
     user_state[uid]["page"] = page
-    total_pages = (len(records) - 1) // RECORDS_PER_PAGE + 1
-    text = f"📋 رکوردهای DNS دامنه: `{zone_name}` (صفحه {page + 1} از {total_pages})\n\n"
-    start_index = page * RECORDS_PER_PAGE
-    end_index = start_index + RECORDS_PER_PAGE
+    page_display = page + 1 if total_pages > 0 else 0
+
+    # build header (plain text)
+    dots = "(هیچ رکوردی)" if total_pages == 0 else "".join(["●" if i == page else "○" for i in range(min(total_pages, 7))])
+    header = f"📋 رکوردهای DNS — {zone_name}
+{total_records} رکورد • صفحه {page_display}/{total_pages}
+{dots}
+
+"
+
+    body_text = header
     keyboard = []
-    for rec in records[start_index:end_index]:
-        if rec["type"] in ["A", "AAAA", "CNAME"]:
-            name = rec["name"].replace(f".{zone_name}", "").replace(zone_name, "@")
-            content = rec["content"]
-            keyboard.append([
-                InlineKeyboardButton(name, callback_data="noop"),
-                InlineKeyboardButton(f"{content} | ⚙️", callback_data=f"record_settings_{rec['id']}")
-            ])
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ قبلی", callback_data="page_prev"))
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("➡️ بعدی", callback_data="page_next"))
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-    keyboard.append([
-        InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record"),
-        InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")
-    ])
+
+    if total_records == 0:
+        body_text += "هیچ رکوردی برای این دامنه ثبت نشده است."
+    else:
+        start_index = page * RECORDS_PER_PAGE
+        end_index = min(start_index + RECORDS_PER_PAGE, total_records)
+        for rec in records[start_index:end_index]:
+            try:
+                rtype = rec.get("type")
+                if rtype in ["A", "AAAA", "CNAME"]:
+                    name = rec.get("name", "")
+                    if zone_name and name.endswith(f".{zone_name}"):
+                        name = name[: - (len(zone_name) + 1)]
+                    elif name == zone_name:
+                        name = "@"
+                    content = rec.get("content", "")
+                    summary = f"{name} — {content} ({rtype})"
+                    # single button per record to avoid layout issues
+                    keyboard.append([InlineKeyboardButton(summary, callback_data=f"record_settings_{rec.get('id')}")])
+            except Exception:
+                logger.exception("Error while building record row")
+
+    # navigation
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⏮️", callback_data="goto_page_1"))
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data="page_prev"))
+        # numeric buttons centered
+        num_buttons = min(5, total_pages)
+        start_num = max(1, page_display - num_buttons // 2)
+        if start_num + num_buttons - 1 > total_pages:
+            start_num = max(1, total_pages - num_buttons + 1)
+        num_row = []
+        for p in range(start_num, start_num + num_buttons):
+            label = f"[{p}]" if p == page_display else str(p)
+            num_row.append(InlineKeyboardButton(label, callback_data=f"goto_page_{p}"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data="page_next"))
+            nav_row.append(InlineKeyboardButton("⏭️", callback_data=f"goto_page_{total_pages}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        keyboard.append(num_row)
+
+    # actions
+    keyboard.append([InlineKeyboardButton("➕ افزودن رکورد", callback_data="add_record"), InlineKeyboardButton("🔄 رفرش", callback_data="refresh_records")])
+    keyboard.append([InlineKeyboardButton("📤 Export JSON", callback_data="export_json"), InlineKeyboardButton("📤 Export CSV", callback_data="export_csv")])
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_domains")])
-    await update.callback_query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # send or edit
+    msg = None
+    if getattr(update, "callback_query", None) and update.callback_query and getattr(update.callback_query, "message", None):
+        msg = update.callback_query.message
+    elif getattr(update, "message", None):
+        msg = update.message
+
+    if not msg:
+        logger.warning("No message object available to send refresh_records output")
+        return
+
+    try:
+        await msg.edit_text(body_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        try:
+            await msg.reply_text(body_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception:
+            logger.exception("Failed to send refresh_records message")
 
 
 async def show_record_settings(message, uid, zone_id, record_id):
@@ -181,7 +271,12 @@ async def show_record_settings(message, uid, zone_id, record_id):
         await message.reply_text("❌ خطا در دریافت اطلاعات رکورد.")
         return
     user_state[uid]["record_id"] = record_id
-    text = (f"⚙️ تنظیمات رکورد: `{record['name']}`\n\n**Type:** `{record['type']}`\n**IP:** `{record['content']}`\n**TTL:** `{record['ttl']}`\n**Proxied:** {'✅ فعال' if record.get('proxied') else '❌ غیرفعال'}")
+    text = (f"⚙️ تنظیمات رکورد: `{record['name']}`
+
+**Type:** `{record['type']}`
+**IP:** `{record['content']}`
+**TTL:** `{record['ttl']}`
+**Proxied:** {'✅ فعال' if record.get('proxied') else '❌ غیرفعال'}")
     keyboard = [[InlineKeyboardButton("🖊 تغییر IP", callback_data=f"editip_{record_id}"), InlineKeyboardButton("🕒 تغییر TTL", callback_data=f"edittll_{record_id}"), InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")], [InlineKeyboardButton("🗑 حذف", callback_data=f"confirm_delete_{record_id}"), InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_records")]]
     await message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -191,14 +286,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     uid = query.from_user.id
     data = query.data
-    
+
     if not is_user_authorized(uid):
         return await query.message.reply_text("❌ شما اجازه دسترسی به این ربات را ندارید.")
 
     if data == "back_to_domains" or data == "refresh_domains" or data == "back_to_main":
         await start(update, context)
         return
-        
+
     if data == "manage_users":
         if uid == ADMIN_ID: await manage_users_menu(update, context)
         return
@@ -206,7 +301,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "add_user_prompt":
         if uid == ADMIN_ID:
             user_state[uid]['mode'] = 'adding_user'
-            text = "لطفاً شناسه عددی (ID) کاربر مورد نظر را ارسال کنید.\n\nراهنمایی: از کاربر بخواهید یک پیام به ربات @userinfobot ارسال کند تا شناسه خود را دریافت نماید."
+            text = "لطفاً شناسه عددی (ID) کاربر مورد نظر را ارسال کنید.
+
+راهنمایی: از کاربر بخواهید یک پیام به ربات @userinfobot ارسال کند تا شناسه خود را دریافت نماید."
             await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="manage_users")]]))
         return
 
@@ -227,13 +324,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "show_help":
         await show_help(update, context)
         return
-    
+
     if data == "cancel_action":
         reset_user_state(uid, keep_zone=True)
         await query.message.edit_text("❌ عملیات لغو شد.")
         await refresh_records(uid, update, page=user_state[uid].get("page", 0))
         return
-        
+
     if data.startswith("zone_"):
         zone_id = data.split("_")[1]
         try:
@@ -248,13 +345,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🔄 در حال بروزرسانی...")
         await refresh_records(uid, update, page=user_state[uid].get("page", 0))
         return
-    
+
     if data == "page_next":
         await refresh_records(uid, update, page=user_state[uid].get("page", 0) + 1)
         return
-        
+
     if data == "page_prev":
         await refresh_records(uid, update, page=user_state[uid].get("page", 0) - 1)
+        return
+
+    if data.startswith("goto_page_"):
+        try:
+            p = int(data.split("_")[2])
+            # goto_page uses 1-based indexing in the button labels
+            await refresh_records(uid, update, page=max(0, p - 1))
+        except Exception:
+            await query.answer("❌ شماره صفحه نامعتبر است.", show_alert=True)
+        return
+
+    if data == "export_json":
+        try:
+            zone_id_local = user_state[uid].get("zone_id")
+            records = get_dns_records(zone_id_local)
+            text = json.dumps(records, ensure_ascii=False, indent=2)
+            bio = io.BytesIO(text.encode('utf-8'))
+            bio.name = f"{user_state[uid].get('zone_name','records')}.json"
+            await context.bot.send_document(chat_id=uid, document=bio)
+        except Exception:
+            await query.answer("❌ امکان تهیه خروجی وجود ندارد.", show_alert=True)
+        return
+
+    if data == "export_csv":
+        try:
+            zone_id_local = user_state[uid].get("zone_id")
+            records = get_dns_records(zone_id_local)
+            si = io.StringIO()
+            writer = csv.writer(si)
+            writer.writerow(["id","type","name","content","ttl","proxied"])
+            for r in records:
+                writer.writerow([r.get('id',''), r.get('type',''), r.get('name',''), r.get('content',''), r.get('ttl',''), r.get('proxied',False)])
+            csv_bytes = si.getvalue().encode('utf-8')
+            bio = io.BytesIO(csv_bytes)
+            bio.name = f"{user_state[uid].get('zone_name','records')}.csv"
+            await context.bot.send_document(chat_id=uid, document=bio)
+        except Exception:
+            await query.answer("❌ امکان تهیه خروجی وجود ندارد.", show_alert=True)
         return
 
     zone_id = user_state[uid].get("zone_id")
@@ -275,7 +410,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if success: await show_record_settings(query.message, uid, zone_id, record_id)
         except Exception as e:
             await query.answer("❌ خطا در ارتباط با API.", show_alert=True)
-            
+
     elif data.startswith("edittll_"):
         record_id = data.split("_")[1]
         user_state[uid].update({"mode": "editing_ttl", "record_id": record_id})
@@ -293,7 +428,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if success: await show_record_settings(query.message, uid, zone_id, record_id)
         except Exception as e:
             await query.answer("❌ خطا در ارتباط با API.", show_alert=True)
-            
+
     elif data.startswith("editip_"):
         record_id = data.split("_")[1]
         user_state[uid].update({"mode": "editing_ip", "record_id": record_id})
@@ -383,8 +518,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success, result = add_domain_to_cloudflare(text)
             if success:
                 zone_info = get_zone_info_by_id(result['id'])
-                ns = "\n".join(zone_info.get("name_servers", ["N/A"]))
-                await update.message.reply_text(f"✅ دامنه `{text}` با موفقیت اضافه شد.\n**وضعیت:** `{zone_info['status']}`\n\n❗️ لطفاً Name Server های دامنه خود را به موارد زیر تغییر دهید:\n`{ns}`", parse_mode="Markdown")
+                ns = "
+".join(zone_info.get("name_servers", ["N/A"]))
+                await update.message.reply_text(f"✅ دامنه `{text}` با موفقیت اضافه شد.
+**وضعیت:** `{zone_info['status']}`
+
+❗️ لطفاً Name Server های دامنه خود را به موارد زیر تغییر دهید:
+`{ns}`", parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"❌ خطا در افزودن دامنه: {result}")
         except Exception as e:
