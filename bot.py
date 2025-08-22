@@ -63,7 +63,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4"] 
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
 
 user_state = defaultdict(dict)
 
@@ -114,7 +114,7 @@ async def check_ip_ping(ip: str, location: str):
             node_info = results['meta'][node_key]
             if node_info.get('country') == location.upper():
                 node_result = results.get(node_key)
-                if node_result:
+                if node_result and len(node_result) > 0:
                     for ping_report in node_result:
                         if len(ping_report) > 1 and ping_report[1] is not None:
                             logger.info(f"Successful ping from node {node_key} for {ip}")
@@ -416,7 +416,7 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     state = user_state[uid]
     zone_id = state['zone_id']
     settings = load_smart_settings()
-    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id), None)
+    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
     
     is_auto_check_enabled = record_config is not None
     check_location = record_config.get("location", "ir") if record_config else "ir"
@@ -758,7 +758,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sub_action = parts[2]
             settings = load_smart_settings()
             record_list = settings.setdefault("auto_check_records", [])
-            record_config = next((item for item in record_list if item["record_id"] == record_id), None)
+            record_config = next((item for item in record_list if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
             if sub_action == "loc":
                 if not record_config:
                     record_config = {"zone_id": zone_id, "record_id": record_id, "location": "de"}
