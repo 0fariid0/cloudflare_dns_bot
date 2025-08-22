@@ -63,7 +63,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
 
 user_state = defaultdict(dict)
 
@@ -778,8 +778,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ip_list = ip_lists.get(list_type, [])
             title = "IPهای رزرو" if list_type == "reserve" else "IPهای منسوخ"
             text = f"*{title}:*\n\n"
+            keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]
+            if list_type == "deprecated" and ip_list:
+                keyboard.insert(0, [InlineKeyboardButton("🗑️ خالی کردن لیست", callback_data=f"smart_clear_deprecated_{record_id}")])
             text += "\n".join(f"`{ip}`" for ip in ip_list) if ip_list else "این لیست خالی است."
-            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]), parse_mode="Markdown")
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif action == "clear":
+            if parts[2] == "deprecated":
+                ip_lists = load_ip_lists()
+                ip_lists["deprecated"] = []
+                save_ip_lists(ip_lists)
+                await query.answer("✅ لیست IPهای منسوخ خالی شد.")
+                log_action(uid, "Cleared deprecated IP list.")
+                await show_smart_connection_menu(update, context, record_id)
         elif action == "run":
             await query.message.edit_text("⏳ بررسی دستی شروع شد. لطفاً منتظر بمانید...")
             await run_smart_check_logic(context, zone_id, record_id, uid)
