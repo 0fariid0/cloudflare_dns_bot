@@ -3,6 +3,7 @@ import json
 import re
 import requests
 import time
+import asyncio
 from collections import defaultdict
 from enum import Enum, auto
 from datetime import datetime, timedelta
@@ -97,55 +98,63 @@ async def check_ip_ping(ip: str, location: str):
     params = {'host': ip, 'node': location}
     headers = {'Accept': 'application/json'}
     try:
-        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers)
+        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers, timeout=30)
         response.raise_for_status()
-        request_id = response.json().get("request_id")
+        data = response.json()
+        request_id = data.get("request_id")
         if not request_id:
             logger.error(f"check-host.net did not return a request_id for {ip} from {location}: {response.text}")
             return False, "No request ID"
-        time.sleep(5)
+        
+        await asyncio.sleep(10)
+        
         result_url = f"https://check-host.net/check-result/{request_id}"
-        result_response = requests.get(result_url, headers=headers)
+        result_response = requests.get(result_url, headers=headers, timeout=30)
         result_response.raise_for_status()
         results = result_response.json()
         
         report = []
         is_successful_ping = False
         
-        for node_key in results.get('meta', {}):
-            node_info = results['meta'][node_key]
-            if node_info.get('country') == location.upper():
-                node_result = results.get(node_key)
-                if node_result and len(node_result) > 0:
-                    packets_sent = 0
-                    packets_received = 0
-                    min_ping = float('inf')
-                    avg_ping = 0
-                    successful_pings = []
-                    
-                    for ping_report in node_result:
-                        if len(ping_report) > 1 and ping_report[1] is not None:
-                            successful_pings.append(ping_report[1])
-                    
-                    packets_sent = len(node_result)
-                    packets_received = len(successful_pings)
-                    
-                    if packets_received > 0:
-                        is_successful_ping = True
-                        min_ping = min(successful_pings)
-                        avg_ping = sum(successful_pings) / packets_received
-                        report.append(f"✅ {node_info.get('city', '')}, {node_info.get('country')}\n{packets_received} / {packets_sent} \n{min_ping:.1f} / {avg_ping:.1f} ms\n{ip}")
-                    else:
-                        report.append(f"❌ {node_info.get('city', '')}, {node_info.get('country')}\n{packets_received} / {packets_sent}\nNo ping")
+        for node_key, node_result in results.items():
+            if node_key == 'meta':
+                continue
+                
+            if not isinstance(node_result, list) or len(node_result) == 0:
+                continue
+                
+            node_info = results.get('meta', {}).get(node_key, {})
+            node_country = node_info.get('country', 'Unknown')
+            node_city = node_info.get('city', 'Unknown')
+            
+            if location.upper() != node_country.upper():
+                continue
+                
+            packets_sent = len(node_result)
+            packets_received = 0
+            successful_pings = []
+            
+            for ping_report in node_result:
+                if ping_report and isinstance(ping_report, list) and len(ping_report) > 1 and ping_report[1] is not None:
+                    packets_received += 1
+                    successful_pings.append(ping_report[1])
+            
+            if packets_received > 0:
+                is_successful_ping = True
+                min_ping = min(successful_pings)
+                avg_ping = sum(successful_pings) / packets_received
+                report.append(f"✅ {node_city}, {node_country}\n{packets_received}/{packets_sent} packets\n{min_ping:.1f}/{avg_ping:.1f} ms\n{ip}")
+            else:
+                report.append(f"❌ {node_city}, {node_country}\n{packets_received}/{packets_sent} packets\nNo ping")
         
-        if not is_successful_ping:
-            report.append("🚫 پینگ از هیچ یک از نودهای مربوطه موفق نبود.")
+        if not report:
+            report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
         
         return is_successful_ping, "\n".join(report)
 
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error(f"Error checking IP ping for {ip} from {location}: {e}")
-        return False, f"❌ خطا در ارتباط با check-host.net: {e}"
+        return False, f"❌ خطا در بررسی پینگ: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
