@@ -1,6 +1,8 @@
 import logging
 import json
 import re
+import requests
+import time
 from collections import defaultdict
 from enum import Enum, auto
 from datetime import datetime
@@ -44,6 +46,41 @@ except ImportError:
         if zone_id in MOCKED_ZONES:
             del MOCKED_ZONES[zone_id]
             return True
+        return False
+
+CLEAN_IP_SOURCE = ["1.1.1.1", "1.0.0.1"]
+def get_a_clean_ip():
+    return CLEAN_IP_SOURCE[0]
+
+async def check_ip_ping_from_iran(ip: str):
+    params = {'host': ip, 'node': 'ir'}
+    headers = {'Accept': 'application/json'}
+    try:
+        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers)
+        response.raise_for_status()
+        request_id = response.json().get("request_id")
+        if not request_id:
+            logger.error(f"check-host.net did not return a request_id: {response.text}")
+            return False
+
+        time.sleep(5)
+        result_url = f"https://check-host.net/check-result/{request_id}"
+        result_response = requests.get(result_url, headers=headers)
+        result_response.raise_for_status()
+        results = result_response.json()
+        
+        for node, result in results.items():
+            if "ir" in node and result is not None:
+                for ping_result in result:
+                    if ping_result[1] is not None:
+                        logger.info(f"Successful ping from node {node} for {ip}")
+                        return True
+        
+        logger.warning(f"No successful ping for {ip} from any Iranian node.")
+        return False
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error checking IP ping from Iran for {ip}: {e}")
         return False
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -361,8 +398,10 @@ async def show_record_settings(message, uid, zone_id, record_id):
     proxied_status = '✅ فعال' if record.get('proxied') else '❌ غیرفعال'
     text = f"⚙️ تنظیمات رکورد: `{record['name']}`\n\n**Type:** `{record['type']}`\n**Content:** `{record['content']}`\n**TTL:** `{record['ttl']}`\n**Proxied:** {proxied_status}"
     keyboard = [[InlineKeyboardButton("🖊 تغییر IP/Content", callback_data=f"editip_{record_id}"), InlineKeyboardButton("🕒 تغییر TTL", callback_data=f"edittll_{record_id}")],
-                [InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")]]
+                 [InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")]]
     action_row = []
+    if record['type'] == 'A' and record.get('proxied') == False:
+        action_row.append(InlineKeyboardButton("⚙️ بررسی هوشمند", callback_data=f"smart_check_{record_id}"))
     if record['type'] == 'A': action_row.append(InlineKeyboardButton("🐑 کلون", callback_data=f"clone_record_{record_id}"))
     action_row.append(InlineKeyboardButton("🗑️ حذف", callback_data=f"confirm_delete_record_{record_id}"))
     if action_row: keyboard.append(action_row)
@@ -430,8 +469,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(user_id): return
     if not is_user_authorized(user_id):
         await show_request_access_menu(update, context)
-        return
-    await show_main_menu(update, context)
+    else:
+        await show_main_menu(update, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -601,6 +640,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state[uid].update({"zone_id": selected_zone_id, "zone_name": zone_info["name"]}); await show_records_list(update, context)
     elif data.startswith("record_settings_"):
         await show_record_settings(query.message, uid, zone_id, data.split("_")[-1])
+    elif data.startswith("smart_check_"):
+        record_id = data.split("_")[-1]
+        record_details = get_record_details(zone_id, record_id)
+        if not record_details or record_details["type"] != "A" or record_details.get("proxied"):
+            await query.answer("❌ این قابلیت فقط برای رکوردهای نوع A و در حالت غیرپروکسی فعال است.", show_alert=True)
+            return
+        current_ip = record_details["content"]
+        await query.message.edit_text(f"⏳ در حال بررسی پینگ IP `{current_ip}` از ایران...")
+        log_action(uid, f"Initiated smart check for IP '{current_ip}'")
+        ping_is_ok = await check_ip_ping_from_iran(current_ip)
+        if ping_is_ok:
+            await query.message.edit_text(f"✅ آی‌پی `{current_ip}` از ایران پینگ دارد. نیازی به تغییر نیست.")
+            log_action(uid, f"Smart check: IP '{current_ip}' is OK.")
+        else:
+            new_ip = get_a_clean_ip()
+            if not new_ip:
+                await query.message.edit_text("❌ متاسفانه هیچ IP جدیدی برای جایگزینی در دسترس نیست.")
+                log_action(uid, f"Smart check failed: no new IP available.")
+                return
+            await query.message.edit_text(f"🚨 آی‌پی `{current_ip}` از ایران پینگ ندارد! \n🔄 در حال تلاش برای تغییر به `{new_ip}`...")
+            if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], new_ip, record_details["ttl"], record_details.get("proxied", False)):
+                await query.message.edit_text(f"🎉 *عملیات موفق!* آی‌پی با موفقیت به `{new_ip}` تغییر یافت.")
+                log_action(uid, f"Smart check: IP changed from '{current_ip}' to '{new_ip}'")
+            else:
+                await query.message.edit_text("❌ تغییر IP ناموفق بود.")
+                log_action(uid, f"Smart check: IP change failed for '{current_ip}'")
+        await show_record_settings(query.message, uid, zone_id, record_id)
     elif data.startswith("clone_record_"):
         record_id = data.split("_")[-1]; original_record = get_record_details(zone_id, record_id)
         if not original_record: await query.answer("❌ رکورد اصلی یافت نشد.", show_alert=True); return
