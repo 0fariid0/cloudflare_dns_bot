@@ -108,13 +108,20 @@ async def check_ip_ping(ip: str, location: str):
         result_response = requests.get(result_url, headers=headers)
         result_response.raise_for_status()
         results = result_response.json()
-        for node, result in results.items():
-            if location in node and result is not None:
-                for ping_result in result:
-                    if ping_result[1] is not None:
-                        logger.info(f"Successful ping from node {node} for {ip}")
-                        return True
-        logger.warning(f"No successful ping for {ip} from any {location} node.")
+        
+        has_ping_nodes = False
+        for node_key in results.get('meta', {}):
+            node_info = results['meta'][node_key]
+            if node_info.get('country') == location.upper():
+                node_result = results.get(node_key)
+                if node_result:
+                    for ping_report in node_result:
+                        if len(ping_report) > 1 and ping_report[1] is not None:
+                            logger.info(f"Successful ping from node {node_key} for {ip}")
+                            has_ping_nodes = True
+                            return True
+        if not has_ping_nodes:
+            logger.warning(f"No successful ping for {ip} from any {location} node.")
         return False
     except requests.exceptions.RequestException as e:
         logger.error(f"Error checking IP ping for {ip} from {location}: {e}")
@@ -409,7 +416,7 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     state = user_state[uid]
     zone_id = state['zone_id']
     settings = load_smart_settings()
-    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id), None)
     
     is_auto_check_enabled = record_config is not None
     check_location = record_config.get("location", "ir") if record_config else "ir"
@@ -599,7 +606,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     
     current_ip = record_details['content']
     settings = load_smart_settings()
-    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id), None)
+    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
     if not record_config: return
     
     check_location = record_config.get("location", "ir")
