@@ -63,7 +63,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
 
 user_state = defaultdict(dict)
 
@@ -102,30 +102,50 @@ async def check_ip_ping(ip: str, location: str):
         request_id = response.json().get("request_id")
         if not request_id:
             logger.error(f"check-host.net did not return a request_id for {ip} from {location}: {response.text}")
-            return False
+            return False, "No request ID"
         time.sleep(5)
         result_url = f"https://check-host.net/check-result/{request_id}"
         result_response = requests.get(result_url, headers=headers)
         result_response.raise_for_status()
         results = result_response.json()
         
-        has_ping_nodes = False
+        report = []
+        is_successful_ping = False
+        
         for node_key in results.get('meta', {}):
             node_info = results['meta'][node_key]
             if node_info.get('country') == location.upper():
                 node_result = results.get(node_key)
                 if node_result and len(node_result) > 0:
+                    packets_sent = 0
+                    packets_received = 0
+                    min_ping = float('inf')
+                    avg_ping = 0
+                    successful_pings = []
+                    
                     for ping_report in node_result:
                         if len(ping_report) > 1 and ping_report[1] is not None:
-                            logger.info(f"Successful ping from node {node_key} for {ip}")
-                            has_ping_nodes = True
-                            return True
-        if not has_ping_nodes:
-            logger.warning(f"No successful ping for {ip} from any {location} node.")
-        return False
+                            successful_pings.append(ping_report[1])
+                    
+                    packets_sent = len(node_result)
+                    packets_received = len(successful_pings)
+                    
+                    if packets_received > 0:
+                        is_successful_ping = True
+                        min_ping = min(successful_pings)
+                        avg_ping = sum(successful_pings) / packets_received
+                        report.append(f"✅ {node_info.get('city', '')}, {node_info.get('country')}\n{packets_received} / {packets_sent} \n{min_ping:.1f} / {avg_ping:.1f} ms\n{ip}")
+                    else:
+                        report.append(f"❌ {node_info.get('city', '')}, {node_info.get('country')}\n{packets_received} / {packets_sent}\nNo ping")
+        
+        if not is_successful_ping:
+            report.append("🚫 پینگ از هیچ یک از نودهای مربوطه موفق نبود.")
+        
+        return is_successful_ping, "\n".join(report)
+
     except requests.exceptions.RequestException as e:
         logger.error(f"Error checking IP ping for {ip} from {location}: {e}")
-        return False
+        return False, f"❌ خطا در ارتباط با check-host.net: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -607,15 +627,15 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     current_ip = record_details['content']
     settings = load_smart_settings()
     record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
-    if not record_config: return
     
-    check_location = record_config.get("location", "ir")
+    check_location = record_config.get("location", "ir") if record_config else "ir"
     
-    is_pinging = await check_ip_ping(current_ip, check_location)
+    is_pinging, report_text = await check_ip_ping(current_ip, check_location)
+    
+    if user_id != 0: 
+        await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
     
     if is_pinging:
-        if user_id != 0: 
-            await context.bot.send_message(chat_id=user_id, text=f"✅ بررسی دستی: آی‌پی `{current_ip}` برای `{record_details['name']}` سالم است.", parse_mode="Markdown")
         return
 
     ip_lists = load_ip_lists()
@@ -633,9 +653,11 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
         if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
             notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
             
-            is_next_pinging = await check_ip_ping(next_ip, check_location)
+            is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
+            
             if is_next_pinging:
                 notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
+                notification_text += f"\n\n📊 *نتیجه تست آی‌پی جدید:*\n{new_ip_report}"
                 new_ip_found = True
                 break
             else:
