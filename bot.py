@@ -64,7 +64,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
 
 user_state = defaultdict(dict)
 
@@ -154,8 +154,8 @@ async def check_ip_ping(ip: str, location: str):
                 
                 if successful_pings_count > 0:
                     successful_nodes_count += 1
-                    avg_ping = avg_ping_time / successful_pings_count
-                    report.append(f"✅ {node_city}: پینگ موفق ({successful_pings_count} بار) | میانگین: {avg_ping:.3f} ms")
+                    avg_ping_ms = (avg_ping_time / successful_pings_count) * 1000
+                    report.append(f"✅ {node_city}: پینگ موفق ({successful_pings_count} بار) | میانگین: {avg_ping_ms:.1f} ms")
                 else:
                     first_failure_reason = "نامشخص"
                     if ping_results[0] and isinstance(ping_results[0][0], list) and len(ping_results[0][0]) > 0:
@@ -489,6 +489,28 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات رکورد", callback_data=f"record_settings_{record_id}")]
     ]
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def show_interval_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str):
+    text = "⏱️ لطفا بازه زمانی برای بررسی خودکار را انتخاب کنید:"
+    keyboard = [
+        [
+            InlineKeyboardButton("۳۰ دقیقه", callback_data=f"smart_set_interval_{record_id}_1800"),
+            InlineKeyboardButton("۱ ساعت", callback_data=f"smart_set_interval_{record_id}_3600")
+        ],
+        [
+            InlineKeyboardButton("۲ ساعت", callback_data=f"smart_set_interval_{record_id}_7200"),
+            InlineKeyboardButton("۶ ساعت", callback_data=f"smart_set_interval_{record_id}_21600")
+        ],
+        [
+            InlineKeyboardButton("۱۲ ساعت", callback_data=f"smart_set_interval_{record_id}_43200"),
+            InlineKeyboardButton("۱ روز", callback_data=f"smart_set_interval_{record_id}_86400")
+        ],
+        [
+            InlineKeyboardButton("۲ روز", callback_data=f"smart_set_interval_{record_id}_172800")
+        ],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]
+    ]
+    await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = "این ربات برای مدیریت رکوردهای DNS در Cloudflare طراحی شده است."
