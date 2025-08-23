@@ -1,7 +1,6 @@
 import logging
 import json
 import re
-import requests
 import time
 import asyncio
 import httpx
@@ -65,8 +64,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
-TCP_PORT = 443 
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
 
 user_state = defaultdict(dict)
 
@@ -96,12 +94,12 @@ def load_smart_settings():
 def save_smart_settings(settings):
     save_data(SMART_SETTINGS_FILE, settings)
 
-async def check_ip_tcp(ip: str, location: str):
-    params = {'host': f"{ip}:{TCP_PORT}", 'node': location, 'max_nodes': 10}
+async def check_ip_ping(ip: str, location: str):
+    params = {'host': ip, 'node': location, 'max_nodes': 10}
     headers = {'Accept': 'application/json'}
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
+            response = await client.get("https://check-host.net/check-ping", params=params, headers=headers, timeout=10)
             response.raise_for_status()
             initial_data = response.json()
             request_id = initial_data.get("request_id")
@@ -152,7 +150,7 @@ async def check_ip_tcp(ip: str, location: str):
                     first_failure_reason = "نامشخص"
                     if ping_results[0] and isinstance(ping_results[0][0], list) and len(ping_results[0][0]) > 0:
                         first_failure_reason = ping_results[0][0][0]
-                    report.append(f"❌ {node_city}: تست ناموفق ({first_failure_reason})")
+                    report.append(f"❌ {node_city}: پینگ ناموفق ({first_failure_reason})")
 
             if not report:
                 report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
@@ -167,7 +165,7 @@ async def check_ip_tcp(ip: str, location: str):
             return is_overall_successful, "\n".join(report)
 
     except Exception as e:
-        logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
+        logger.error(f"Error in check_ip_ping for {ip} from {location}: {e}")
         return False, f"❌ خطا در ارتباط با API: {e}"
 
 def log_action(user_id: int, action: str):
@@ -662,7 +660,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     elif record_config:
         check_location = record_config.get("location", "ir")
 
-    is_pinging, report_text = await check_ip_tcp(current_ip, check_location)
+    is_pinging, report_text = await check_ip_ping(current_ip, check_location)
     
     if user_id != 0: 
         await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
@@ -684,7 +682,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
             if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
                 notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
                 
-                is_next_pinging, new_ip_report = await check_ip_tcp(next_ip, check_location)
+                is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
                 
                 if is_next_pinging:
                     notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
@@ -844,11 +842,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log_action(uid, "Cleared deprecated IP list.")
                 await show_smart_connection_menu(update, context, record_id)
         elif action == "run":
-            await query.message.edit_text(f"⏳ بررسی دستی TCP پورت {TCP_PORT} شروع شد. لطفاً منتظر بمانید...")
+            await query.message.edit_text(f"⏳ بررسی دستی پینگ شروع شد. لطفاً منتظر بمانید...")
             await run_smart_check_logic(context, zone_id, record_id, uid)
             await show_smart_connection_menu(update, context, record_id)
         elif action == "quick":
-            await query.message.edit_text(f"⏳ در حال اجرای تست سریع IP `{record_id}`...")
+            await query.message.edit_text(f"⏳ در حال اجرای تست سریع پینگ برای IP `{record_id}`...")
             record_details = get_record_details(zone_id, record_id)
             if not record_details: return
             ip_to_test = record_details['content']
@@ -857,7 +855,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
             check_location = record_config.get("location", "ir") if record_config else "ir"
             
-            is_pinging, report_text = await check_ip_tcp(ip_to_test, check_location)
+            is_pinging, report_text = await check_ip_ping(ip_to_test, check_location)
             
             await query.message.edit_text(f"📊 **نتیجه بررسی IP** `{ip_to_test}`:\n\n{report_text}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]) )
             
@@ -881,7 +879,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("2 min", callback_data=f"update_ttl_{record_id}_120")],
             [InlineKeyboardButton("5 min", callback_data=f"update_ttl_{record_id}_300"), InlineKeyboardButton("10 min", callback_data=f"update_ttl_{record_id}_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_{record_id}_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback=f"update_ttl_{record_id}_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
