@@ -6,9 +6,9 @@ echo "🚀 Cloudflare DNS Telegram"
 
 # گرفتن اطلاعات از کاربر
 read -p "Enter Bot Token: " bot_token
-read -p "Enter CLOUDFLARE_EMAIL : " cf_email
+read -p "Enter CLOUDFLARE_EMAIL: " cf_email
 read -p "Enter CLOUDFLARE_API_KEY: " cf_api
-read -p "Enter ID_number Admin (EX'5123552') : " admin_id
+read -p "Enter ID_number Admin (EX'5123552'): " admin_id
 
 # کپی فایل config.py از template
 cp config.py.template config.py
@@ -22,15 +22,20 @@ sed -i "s|ADMIN_ID = \"\"|ADMIN_ID = $admin_id|" config.py
 echo "✅ Config file created successfully."
 
 # نصب ابزار لازم
+echo "📦 Installing system packages..."
 apt update -y
 apt install python3-venv git -y
 
 # ساخت محیط مجازی و نصب پکیج‌ها
+echo "🐍 Creating virtual environment and installing packages..."
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install python-telegram-bot[job-queue]==20.7
+pip install httpx
 deactivate
+
+echo "✅ Python packages installed successfully."
 
 # ساخت systemd سرویس
 SERVICE_FILE="/etc/systemd/system/cloudflarebot.service"
@@ -52,9 +57,10 @@ WantedBy=multi-user.target
 EOF
 
 # فعال‌سازی و اجرا
+echo "🚀 Setting up and starting the systemd service..."
 systemctl daemon-reload
 systemctl enable cloudflarebot
 systemctl restart cloudflarebot
 
 echo "✅ Installation completed successfully."
-echo "📡 status: systemctl status cloudflarebot"
+echo "📡 Check bot status with: systemctl status cloudflarebot"
