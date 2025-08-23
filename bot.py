@@ -1,9 +1,9 @@
 import logging
 import json
 import re
-import requests
 import time
 import asyncio
+import httpx
 from collections import defaultdict
 from enum import Enum, auto
 from datetime import datetime, timedelta
@@ -98,79 +98,81 @@ def save_smart_settings(settings):
 async def check_ip_tcp(ip: str, location: str):
     params = {'host': f"{ip}:{TCP_PORT}", 'node': location}
     headers = {'Accept': 'application/json'}
-    try:
-        response = requests.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        initial_data = response.json()
-        request_id = initial_data.get("request_id")
-        nodes_info = initial_data.get("nodes")
-        
-        if not request_id:
-            return False, "پاسخ اولیه از API نامعتبر است (request_id یافت نشد)."
-
-        await asyncio.sleep(10)
-
-        result_url = f"https://check-host.net/check-result/{request_id}"
-        result_response = requests.get(result_url, headers=headers, timeout=20)
-        result_response.raise_for_status()
-        results = result_response.json()
-        
-        if not nodes_info:
-            return False, "اطلاعات نودها در پاسخ اولیه یافت نشد."
-
-        report = []
-        is_overall_successful = False
-        active_nodes_count = 0
-        successful_nodes_count = 0
-
-        for node_key in nodes_info:
-            node_country_code = nodes_info[node_key][0]
-            if location.lower() != node_country_code.lower():
-                continue
-
-            active_nodes_count += 1
-            node_city = nodes_info[node_key][2]
-            ping_results = results.get(node_key)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            initial_data = response.json()
+            request_id = initial_data.get("request_id")
+            nodes_info = initial_data.get("nodes")
             
-            if ping_results is None:
-                report.append(f"⏳ {node_city}: در حال بررسی...")
-                continue
-            
-            if ping_results == [[None]] or not isinstance(ping_results, list) or not ping_results or not isinstance(ping_results[0], list):
-                report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
-                continue
+            if not request_id:
+                return False, "پاسخ اولیه از API نامعتبر است (request_id یافت نشد)."
 
-            packets_sent = len(ping_results[0])
-            packets_received = 0
-            successful_pings = []
+            await asyncio.sleep(10)
             
-            for single_ping in ping_results[0]:
-                if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
-                    packets_received += 1
-                    successful_pings.append(single_ping[1])
+            result_url = f"https://check-host.net/check-result/{request_id}"
+            result_response = await client.get(result_url, headers=headers, timeout=20)
+            result_response.raise_for_status()
+            results = result_response.json()
             
-            if packets_received > 0:
-                successful_nodes_count += 1
-                avg_ping = sum(successful_pings) / packets_received
-                report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ms")
+            if not nodes_info:
+                return False, "اطلاعات نودها در پاسخ اولیه یافت نشد."
+
+            report = []
+            is_overall_successful = False
+            active_nodes_count = 0
+            successful_nodes_count = 0
+
+            for node_key in nodes_info:
+                node_country_code = nodes_info[node_key][0]
+                node_city = nodes_info[node_key][2]
+                
+                if location.lower() != node_country_code.lower():
+                    continue
+
+                active_nodes_count += 1
+                ping_results = results.get(node_key)
+                
+                if ping_results is None:
+                    report.append(f"⏳ {node_city}: در حال بررسی...")
+                    continue
+                
+                if ping_results == [[None]] or not isinstance(ping_results, list) or not ping_results or not isinstance(ping_results[0], list):
+                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
+                    continue
+
+                packets_sent = len(ping_results[0])
+                packets_received = 0
+                successful_pings = []
+                
+                for single_ping in ping_results[0]:
+                    if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
+                        packets_received += 1
+                        successful_pings.append(single_ping[1])
+                
+                if packets_received > 0:
+                    successful_nodes_count += 1
+                    avg_ping = sum(successful_pings) / packets_received
+                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ms")
+                else:
+                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
+
+            if not report:
+                report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
+            
+            if location.lower() == "ir":
+                if successful_nodes_count == active_nodes_count and active_nodes_count > 0:
+                    is_overall_successful = True
             else:
-                report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
+                if successful_nodes_count > 0:
+                    is_overall_successful = True
 
-        if not report:
-            report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
+            return is_overall_successful, "\n".join(report)
 
-        if location.lower() == "ir":
-            if successful_nodes_count == active_nodes_count and active_nodes_count > 0:
-                is_overall_successful = True
-        else: # For other locations like 'de'
-            if successful_nodes_count > 0:
-                is_overall_successful = True
-
-        return is_overall_successful, "\n".join(report)
-
-    except Exception as e:
-        logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
-        return False, f"❌ خطا در ارتباط با API: {e}"
+        except Exception as e:
+            logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
+            return False, f"❌ خطا در ارتباط با API: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -573,8 +575,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_ip_lists(ip_lists)
         await update.message.reply_text(f"✅ تعداد {added_count} آی‌پی جدید به لیست رزرو اضافه شد.")
         log_action(uid, f"Added {added_count} new IPs to reserve list.")
-        reset_user_state(uid, keep_zone=True)
-        q = await update.message.reply_text("بازگشت به منو...")
+        q = update.message
         await show_smart_connection_menu(q, context, record_id)
         return
 
@@ -590,7 +591,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ شناسه عددی ارسال کنید.")
         finally:
             reset_user_state(uid)
-            await manage_whitelist_menu(update, context)
+            q = update.message
+            await manage_whitelist_menu(q, context)
         return
 
     elif mode == State.CLONING_NEW_IP:
@@ -606,7 +608,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e: logger.error(f"Error creating cloned record: {e}"); await update.message.reply_text("❌ خطا در ارتباط با API.")
         finally:
             reset_user_state(uid, keep_zone=True)
-            await show_records_list(update, context)
+            q = update.message
+            await show_records_list(q, context)
+            
 
     elif mode == State.EDITING_IP:
         new_content = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
@@ -622,13 +626,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await show_record_settings(new_msg, uid, zone_id, record_id)
                 else: 
                     await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
-                    reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
+                    reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
             else: 
                 await update.message.reply_text("❌ رکورد مورد نظر یافت نشد.")
-                reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
+                reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
         except Exception: 
             await update.message.reply_text("❌ خطا در ارتباط با API.")
-            reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
+            reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
 
     elif mode == State.ADDING_RECORD_NAME:
         user_state[uid]["record_data"]["name"] = text
