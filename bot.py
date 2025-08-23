@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import requests
 import time
 import asyncio
 import httpx
@@ -132,24 +133,26 @@ async def check_ip_tcp(ip: str, location: str):
                 ping_results = results.get(node_key)
                 
                 if not ping_results or not isinstance(ping_results, list) or not ping_results[0] or not isinstance(ping_results[0], list):
-                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ خالی یا نامعتبر)")
+                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
                     continue
 
-                packets_sent = len(ping_results[0])
-                packets_received = 0
-                successful_pings = []
-                
+                successful_pings_count = 0
+                avg_ping_time = 0.0
+
                 for single_ping in ping_results[0]:
                     if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
-                        packets_received += 1
-                        successful_pings.append(single_ping[1])
+                        successful_pings_count += 1
+                        avg_ping_time += single_ping[1]
                 
-                if packets_received > 0:
+                if successful_pings_count > 0:
                     successful_nodes_count += 1
-                    avg_ping = sum(successful_pings) / packets_received
-                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ms")
+                    avg_ping = avg_ping_time / successful_pings_count
+                    report.append(f"✅ {node_city}: پینگ موفق ({successful_pings_count} بار) | میانگین: {avg_ping:.3f} ms")
                 else:
-                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
+                    first_failure_reason = "نامشخص"
+                    if ping_results[0] and isinstance(ping_results[0][0], list) and len(ping_results[0][0]) > 0:
+                        first_failure_reason = ping_results[0][0][0]
+                    report.append(f"❌ {node_city}: تست ناموفق ({first_failure_reason})")
 
             if not report:
                 report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
@@ -878,7 +881,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("2 min", callback_data=f"update_ttl_{record_id}_120")],
             [InlineKeyboardButton("5 min", callback_data=f"update_ttl_{record_id}_300"), InlineKeyboardButton("10 min", callback_data=f"update_ttl_{record_id}_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback=f"update_ttl_{record_id}_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_{record_id}_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
