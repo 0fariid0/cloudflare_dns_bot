@@ -98,63 +98,67 @@ async def check_ip_ping(ip: str, location: str):
     params = {'host': ip, 'node': location}
     headers = {'Accept': 'application/json'}
     try:
-        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers, timeout=30)
+        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        request_id = data.get("request_id")
-        if not request_id:
-            logger.error(f"check-host.net did not return a request_id for {ip} from {location}: {response.text}")
-            return False, "No request ID"
-        
+        initial_data = response.json()
+        request_id = initial_data.get("request_id")
+        nodes_info = initial_data.get("nodes")
+        if not request_id or not nodes_info:
+            logger.error(f"check-host.net did not return a valid initial response for {ip}: {response.text}")
+            return False, "پاسخ اولیه از API نامعتبر است"
+
         await asyncio.sleep(10)
-        
+
         result_url = f"https://check-host.net/check-result/{request_id}"
-        result_response = requests.get(result_url, headers=headers, timeout=30)
+        result_response = requests.get(result_url, headers=headers, timeout=20)
         result_response.raise_for_status()
         results = result_response.json()
-        
+
         report = []
-        is_successful_ping = False
-        
-        for node_key, node_result in results.items():
-            if node_key == 'meta':
+        is_overall_successful = False
+
+        for node_key, ping_results in results.items():
+            if node_key not in nodes_info:
                 continue
-                
-            if not isinstance(node_result, list) or len(node_result) == 0:
+
+            node_country_code = nodes_info[node_key][0]
+            node_city = nodes_info[node_key][2]
+
+            if location.lower() != node_country_code.lower():
                 continue
-                
-            node_info = results.get('meta', {}).get(node_key, {})
-            node_country = node_info.get('country', 'Unknown')
-            node_city = node_info.get('city', 'Unknown')
             
-            if location.upper() != node_country.upper():
+            if ping_results is None:
+                report.append(f"⏳ {node_city}: در حال بررسی...")
                 continue
-                
-            packets_sent = len(node_result)
+            if ping_results == [[None]]:
+                report.append(f"❌ {node_city}: تست ناموفق (عدم اتصال)")
+                continue
+
             packets_received = 0
-            successful_pings = []
-            
-            for ping_report in node_result:
-                if ping_report and isinstance(ping_report, list) and len(ping_report) > 1 and ping_report[1] is not None:
-                    packets_received += 1
-                    successful_pings.append(ping_report[1])
-            
-            if packets_received > 0:
-                is_successful_ping = True
-                min_ping = min(successful_pings)
-                avg_ping = sum(successful_pings) / packets_received
-                report.append(f"✅ {node_city}, {node_country}\n{packets_received}/{packets_sent} packets\n{min_ping:.1f}/{avg_ping:.1f} ms\n{ip}")
-            else:
-                report.append(f"❌ {node_city}, {node_country}\n{packets_received}/{packets_sent} packets\nNo ping")
+            total_time = 0
+            if isinstance(ping_results, list) and len(ping_results) > 0 and isinstance(ping_results[0], list):
+                packets_sent = len(ping_results[0])
+                for single_ping in ping_results[0]:
+                    if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
+                        packets_received += 1
+                        total_time += single_ping[1]
+                
+                if packets_received > 0:
+                    is_overall_successful = True
+                    avg_ping = total_time / packets_received
+                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ثانیه")
+                else:
+                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent}")
         
         if not report:
             report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
-        
-        return is_successful_ping, "\n".join(report)
+
+        return is_overall_successful, "\n".join(report)
 
     except Exception as e:
-        logger.error(f"Error checking IP ping for {ip} from {location}: {e}")
-        return False, f"❌ خطا در بررسی پینگ: {e}"
+        logger.error(f"Error in check_ip_ping for {ip} from {location}: {e}")
+        return False, f"❌ خطا در ارتباط با API: {e}"
+
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -637,52 +641,57 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     settings = load_smart_settings()
     record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
     
-    check_location = record_config.get("location", "ir") if record_config else "ir"
-    
+    check_location = "ir"
+    if user_id != 0: 
+        manual_record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+        if manual_record_config:
+            check_location = manual_record_config.get("location", "ir")
+    elif record_config:
+        check_location = record_config.get("location", "ir")
+
     is_pinging, report_text = await check_ip_ping(current_ip, check_location)
     
     if user_id != 0: 
         await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
-    
-    if is_pinging:
-        return
+        if is_pinging: return
 
-    ip_lists = load_ip_lists()
-    
-    if current_ip in ip_lists["reserve"]: ip_lists["reserve"].remove(current_ip)
-    if current_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(current_ip)
-
-    notification_text = f"🚨 *گزارش اتصال هوشمند برای `{record_details['name']}`*\n\n"
-    notification_text += f"- آی‌پی فعلی `{current_ip}` از کار افتاد و به لیست منسوخ منتقل شد.\n"
-    
-    new_ip_found = False
-    while ip_lists["reserve"]:
-        next_ip = ip_lists["reserve"].pop(0)
+    if not is_pinging:
+        ip_lists = load_ip_lists()
         
-        if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
-            notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
+        if current_ip in ip_lists["reserve"]: ip_lists["reserve"].remove(current_ip)
+        if current_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(current_ip)
+
+        notification_text = f"🚨 *گزارش اتصال هوشمند برای `{record_details['name']}`*\n\n"
+        notification_text += f"- آی‌پی فعلی `{current_ip}` از کار افتاد و به لیست منسوخ منتقل شد.\n"
+        
+        new_ip_found = False
+        while ip_lists["reserve"]:
+            next_ip = ip_lists["reserve"].pop(0)
             
-            is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
-            
-            if is_next_pinging:
-                notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
-                notification_text += f"\n\n📊 *نتیجه تست آی‌پی جدید:*\n{new_ip_report}"
-                new_ip_found = True
-                break
+            if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
+                notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
+                
+                is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
+                
+                if is_next_pinging:
+                    notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
+                    notification_text += f"\n\n📊 *نتیجه تست آی‌پی جدید:*\n{new_ip_report}"
+                    new_ip_found = True
+                    break
+                else:
+                    notification_text += f"❌ تست ناموفق! آی‌پی `{next_ip}` نیز از کار افتاده و به لیست منسوخ منتقل شد.\n"
+                    if next_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(next_ip)
             else:
-                notification_text += f"❌ تست ناموفق! آی‌پی `{next_ip}` نیز از کار افتاده و به لیست منسوخ منتقل شد.\n"
-                if next_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(next_ip)
-        else:
-            notification_text += f"- خطا در جایگزینی آی‌پی `{next_ip}`.\n"
+                notification_text += f"- خطا در جایگزینی آی‌پی `{next_ip}`.\n"
 
-    if not new_ip_found:
-        notification_text += "\n🚫 *هشدار:* هیچ آی‌پی سالمی در لیست رزرو باقی نمانده است! لطفاً IP جدید اضافه کنید."
+        if not new_ip_found:
+            notification_text += "\n🚫 *هشدار:* هیچ آی‌پی سالمی در لیست رزرو باقی نمانده است! لطفاً IP جدید اضافه کنید."
 
-    save_ip_lists(ip_lists)
-    
-    target_chat_id = user_id if user_id != 0 else ADMIN_ID
-    await context.bot.send_message(chat_id=target_chat_id, text=notification_text, parse_mode="Markdown")
-    log_action(user_id or "Auto", f"Smart check for {record_details['name']} completed.")
+        save_ip_lists(ip_lists)
+        
+        target_chat_id = user_id if user_id != 0 else ADMIN_ID
+        await context.bot.send_message(chat_id=target_chat_id, text=notification_text, parse_mode="Markdown")
+        log_action(user_id or "Auto", f"Smart check for {record_details['name']} completed.")
 
 async def automated_check_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Running automated 10-minute check job...")
