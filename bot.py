@@ -95,8 +95,8 @@ def load_smart_settings():
 def save_smart_settings(settings):
     save_data(SMART_SETTINGS_FILE, settings)
 
-async def check_ip_tcp(ip: str, location: str, port: int):
-    params = {'host': f"{ip}:{port}", 'node': location}
+async def check_ip_tcp(ip: str, location: str):
+    params = {'host': f"{ip}:{TCP_PORT}", 'node': location}
     headers = {'Accept': 'application/json'}
     try:
         response = requests.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
@@ -104,9 +104,9 @@ async def check_ip_tcp(ip: str, location: str, port: int):
         initial_data = response.json()
         request_id = initial_data.get("request_id")
         nodes_info = initial_data.get("nodes")
-        if not request_id or not nodes_info:
-            logger.error(f"check-host.net did not return a valid initial response for {ip}: {response.text}")
-            return False, "پاسخ اولیه از API نامعتبر است"
+        
+        if not request_id:
+            return False, "پاسخ اولیه از API نامعتبر است (request_id یافت نشد)."
 
         await asyncio.sleep(10)
 
@@ -115,61 +115,62 @@ async def check_ip_tcp(ip: str, location: str, port: int):
         result_response.raise_for_status()
         results = result_response.json()
         
+        if not nodes_info:
+            return False, "اطلاعات نودها در پاسخ اولیه یافت نشد."
+
         report = []
         is_overall_successful = False
-        total_nodes = 0
-        successful_nodes = 0
+        active_nodes_count = 0
+        successful_nodes_count = 0
 
-        for node_key, ping_results in results.items():
-            if node_key not in nodes_info:
-                continue
-
+        for node_key in nodes_info:
             node_country_code = nodes_info[node_key][0]
-            node_city = nodes_info[node_key][2]
-
             if location.lower() != node_country_code.lower():
                 continue
-            
-            total_nodes += 1
 
+            active_nodes_count += 1
+            node_city = nodes_info[node_key][2]
+            ping_results = results.get(node_key)
+            
             if ping_results is None:
                 report.append(f"⏳ {node_city}: در حال بررسی...")
                 continue
-            if ping_results == [[None]]:
-                report.append(f"❌ {node_city}: تست ناموفق (عدم اتصال)")
+            
+            if ping_results == [[None]] or not isinstance(ping_results, list) or not ping_results or not isinstance(ping_results[0], list):
+                report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
                 continue
 
+            packets_sent = len(ping_results[0])
             packets_received = 0
-            total_time = 0
-            if isinstance(ping_results, list) and len(ping_results) > 0 and isinstance(ping_results[0], list):
-                packets_sent = len(ping_results[0])
-                for single_ping in ping_results[0]:
-                    if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
-                        packets_received += 1
-                        total_time += single_ping[1]
-                
-                if packets_received > 0:
-                    successful_nodes += 1
-                    avg_ping = total_time / packets_received
-                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} packets | میانگین: {avg_ping:.3f} ms")
-                else:
-                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
-        
+            successful_pings = []
+            
+            for single_ping in ping_results[0]:
+                if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
+                    packets_received += 1
+                    successful_pings.append(single_ping[1])
+            
+            if packets_received > 0:
+                successful_nodes_count += 1
+                avg_ping = sum(successful_pings) / packets_received
+                report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ms")
+            else:
+                report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
+
         if not report:
             report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
-        
+
         if location.lower() == "ir":
-            if successful_nodes == total_nodes and total_nodes > 0:
+            if successful_nodes_count == active_nodes_count and active_nodes_count > 0:
                 is_overall_successful = True
-        else:
-            if successful_nodes > 0:
+        else: # For other locations like 'de'
+            if successful_nodes_count > 0:
                 is_overall_successful = True
 
         return is_overall_successful, "\n".join(report)
 
     except Exception as e:
-        logger.error(f"Error in check_ip_tcp for {ip}:{port} from {location}: {e}")
-        return False, f"❌ خطا در بررسی پینگ: {e}"
+        logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
+        return False, f"❌ خطا در ارتباط با API: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -477,6 +478,7 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
         [InlineKeyboardButton("📋 مشاهده IPهای رزرو", callback_data=f"smart_view_reserve_{record_id}")],
         [InlineKeyboardButton("🗑 مشاهده IPهای منسوخ", callback_data=f"smart_view_deprecated_{record_id}")],
         [InlineKeyboardButton("▶️ اجرای بررسی دستی", callback_data=f"smart_run_manual_{record_id}")],
+        [InlineKeyboardButton("🔍 تست سریع", callback_data=f"smart_quick_check_{record_id}")],
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات رکورد", callback_data=f"record_settings_{record_id}")]
     ]
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -660,7 +662,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     elif record_config:
         check_location = record_config.get("location", "ir")
 
-    is_pinging, report_text = await check_ip_tcp(current_ip, check_location, TCP_PORT)
+    is_pinging, report_text = await check_ip_tcp(current_ip, check_location)
     
     if user_id != 0: 
         await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
@@ -682,7 +684,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
             if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
                 notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
                 
-                is_next_pinging, new_ip_report = await check_ip_tcp(next_ip, check_location, TCP_PORT)
+                is_next_pinging, new_ip_report = await check_ip_tcp(next_ip, check_location)
                 
                 if is_next_pinging:
                     notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
@@ -845,7 +847,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(f"⏳ بررسی دستی TCP پورت {TCP_PORT} شروع شد. لطفاً منتظر بمانید...")
             await run_smart_check_logic(context, zone_id, record_id, uid)
             await show_smart_connection_menu(update, context, record_id)
-
+        elif action == "quick":
+            await query.message.edit_text(f"⏳ در حال اجرای تست سریع IP `{record_id}`...")
+            record_details = get_record_details(zone_id, record_id)
+            if not record_details: return
+            ip_to_test = record_details['content']
+            
+            settings = load_smart_settings()
+            record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+            check_location = record_config.get("location", "ir") if record_config else "ir"
+            
+            is_pinging, report_text = await check_ip_tcp(ip_to_test, check_location)
+            
+            await query.message.edit_text(f"📊 **نتیجه بررسی IP** `{ip_to_test}`:\n\n{report_text}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]) )
+            
     elif data.startswith("clone_record_"):
         record_id = data.split("_")[-1]; original_record = get_record_details(zone_id, record_id)
         if not original_record: await query.answer("❌ رکورد اصلی یافت نشد.", show_alert=True); return
