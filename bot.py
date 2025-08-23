@@ -1,76 +1,62 @@
 import logging
 import json
 import re
+import time
 import asyncio
 import httpx
 from collections import defaultdict
 from enum import Enum, auto
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue)
 
-# --- Configuration and Mocking (for local testing) ---
 try:
     from cloudflare_api import *
     from config import BOT_TOKEN, ADMIN_ID
 except ImportError:
-    # This block is for running the bot without actual Cloudflare credentials.
     BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
     ADMIN_ID = 123456789
     MOCKED_ZONES = {
         "zone1": {"id": "zone1", "name": "example.com", "status": "active"},
         "zone2": {"id": "zone2", "name": "mysite.org", "status": "active"},
+        "zone3": {"id": "zone3", "name": "anothersite.net", "status": "pending"}
     }
     MOCKED_RECORDS = {
         "zone1": [
-            {"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1", "proxied": False, "ttl": 1},
-            {"id": "rec2", "type": "A", "name": "www.example.com", "content": "2.2.2.2", "proxied": True, "ttl": 120},
+            {"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1"},
+            {"id": "rec2", "type": "CNAME", "name": "www.example.com", "content": "example.com"},
         ],
         "zone2": [
-            {"id": "rec4", "type": "A", "name": "app.mysite.org", "content": "3.3.3.3", "proxied": False, "ttl": 1}
+            {"id": "rec4", "type": "AAAA", "name": "ipv6.mysite.org", "content": "2001:db8::1"}
         ],
+         "zone3": []
     }
     def get_zones(): return list(MOCKED_ZONES.values())
     def get_dns_records(zone_id): return MOCKED_RECORDS.get(zone_id, [])
     def get_record_details(zone_id, record_id):
         for rec in MOCKED_RECORDS.get(zone_id, []):
             if rec["id"] == record_id:
-                return rec
+                return {**rec, "ttl": 1, "proxied": False}
         return None
     def get_zone_info_by_id(zone_id): return MOCKED_ZONES.get(zone_id)
-    def create_dns_record(zone_id, type, name, content, ttl, proxied):
-        new_id = f"mock_rec_{len(MOCKED_RECORDS.get(zone_id, [])) + 1}"
-        MOCKED_RECORDS.setdefault(zone_id, []).append({"id": new_id, "type": type, "name": name, "content": content, "ttl": ttl, "proxied": proxied})
-        return True
+    def create_dns_record(zone_id, type, name, content, ttl, proxied): return True
     def update_dns_record(zone_id, record_id, name, type, content, ttl, proxied):
         for rec in MOCKED_RECORDS.get(zone_id, []):
             if rec["id"] == record_id:
-                rec.update({"content": content, "ttl": ttl, "proxied": proxied})
+                rec["content"] = content
                 return True
         return False
-    def delete_dns_record(zone_id, record_id):
-        if zone_id in MOCKED_RECORDS:
-            MOCKED_RECORDS[zone_id] = [rec for rec in MOCKED_RECORDS[zone_id] if rec["id"] != record_id]
-            return True
-        return False
-    def toggle_proxied_status(zone_id, record_id):
-        for rec in MOCKED_RECORDS.get(zone_id, []):
-            if rec["id"] == record_id:
-                rec["proxied"] = not rec["proxied"]
-                return True
-        return False
+    def delete_dns_record(zone_id, record_id): return True
+    def toggle_proxied_status(zone_id, record_id): return True
     def delete_zone(zone_id):
         if zone_id in MOCKED_ZONES:
             del MOCKED_ZONES[zone_id]
-            del MOCKED_RECORDS[zone_id]
             return True
         return False
 
-# --- Basic Setup ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- File Paths ---
 USER_FILE = "users.json"
 LOG_FILE = "bot_audit.log"
 BLOCKED_USER_FILE = "blocked_users.json"
@@ -78,13 +64,13 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-# --- Global Variables ---
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"]
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
+
 user_state = defaultdict(dict)
+
 class State(Enum):
     NONE, ADDING_USER, ADDING_RECORD_NAME, ADDING_RECORD_CONTENT, EDITING_IP, EDITING_TTL, CLONING_NEW_IP, ADDING_RESERVE_IP = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
-# --- Data Persistence Functions ---
 def load_data(filename, default_data):
     try:
         with open(filename, 'r', encoding='utf-8') as f:
@@ -96,12 +82,28 @@ def save_data(filename, data):
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
 
-def load_ip_lists(): return load_data(IP_LIST_FILE, {"reserve": CLEAN_IP_SOURCE, "deprecated": []})
-def save_ip_lists(ip_lists): save_data(IP_LIST_FILE, ip_lists)
-def load_smart_settings(): return load_data(SMART_SETTINGS_FILE, {"auto_check_records": []})
-def save_smart_settings(settings): save_data(SMART_SETTINGS_FILE, settings)
+def load_ip_lists():
+    return load_data(IP_LIST_FILE, {"reserve": CLEAN_IP_SOURCE, "deprecated": []})
 
-# --- IP Ping Check Function ---
+def save_ip_lists(ip_lists):
+    save_data(IP_LIST_FILE, ip_lists)
+
+def load_smart_settings():
+    return load_data(SMART_SETTINGS_FILE, {"auto_check_records": []})
+
+def save_smart_settings(settings):
+    save_data(SMART_SETTINGS_FILE, settings)
+
+def interval_to_text(seconds):
+    if seconds == 1800: return "۳۰ دقیقه"
+    if seconds == 3600: return "۱ ساعت"
+    if seconds == 7200: return "۲ ساعت"
+    if seconds == 21600: return "۶ ساعت"
+    if seconds == 43200: return "۱۲ ساعت"
+    if seconds == 86400: return "۱ روز"
+    if seconds == 172800: return "۲ روز"
+    return f"{seconds} ثانیه"
+
 async def check_ip_ping(ip: str, location: str):
     params = {'host': ip, 'node': location, 'max_nodes': 10}
     headers = {'Accept': 'application/json'}
@@ -111,7 +113,10 @@ async def check_ip_ping(ip: str, location: str):
             response.raise_for_status()
             initial_data = response.json()
             request_id = initial_data.get("request_id")
-            if not request_id: return False, "پاسخ اولیه از API نامعتبر است."
+            nodes_info = initial_data.get("nodes")
+            
+            if not request_id or not nodes_info:
+                return False, "پاسخ اولیه از API نامعتبر است یا اطلاعات نودها یافت نشد."
 
             await asyncio.sleep(10)
             
@@ -121,37 +126,65 @@ async def check_ip_ping(ip: str, location: str):
             results = result_response.json()
             
             report = []
+            is_overall_successful = False
+            active_nodes_count = 0
             successful_nodes_count = 0
-            total_nodes = 0
 
-            for node_key in results:
-                total_nodes += 1
+            for node_key in nodes_info:
+                node_country_code = nodes_info[node_key][0]
+                node_city = nodes_info[node_key][2]
+                
+                if location.lower() != node_country_code.lower():
+                    continue
+
+                active_nodes_count += 1
                 ping_results = results.get(node_key)
                 
                 if not ping_results or not isinstance(ping_results, list) or not ping_results[0] or not isinstance(ping_results[0], list):
+                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
                     continue
 
-                successful_pings_count = sum(1 for single_ping in ping_results[0] if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK")
+                successful_pings_count = 0
+                avg_ping_time = 0.0
+
+                for single_ping in ping_results[0]:
+                    if isinstance(single_ping, list) and len(single_ping) > 0 and single_ping[0] == "OK":
+                        successful_pings_count += 1
+                        avg_ping_time += single_ping[1]
                 
                 if successful_pings_count > 0:
                     successful_nodes_count += 1
+                    avg_ping = avg_ping_time / successful_pings_count
+                    report.append(f"✅ {node_city}: پینگ موفق ({successful_pings_count} بار) | میانگین: {avg_ping:.3f} ms")
+                else:
+                    first_failure_reason = "نامشخص"
+                    if ping_results[0] and isinstance(ping_results[0][0], list) and len(ping_results[0][0]) > 0:
+                        first_failure_reason = ping_results[0][0][0]
+                    report.append(f"❌ {node_city}: پینگ ناموفق ({first_failure_reason})")
+
+            if not report:
+                report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
             
-            if total_nodes == 0:
-                return False, "هیچ نودی برای تست یافت نشد."
-            
-            is_overall_successful = (successful_nodes_count == total_nodes) if location.lower() == "ir" else (successful_nodes_count > 0)
-            
-            return is_overall_successful, f"تعداد نودهای موفق: {successful_nodes_count} از {total_nodes}"
+            if location.lower() == "ir":
+                if successful_nodes_count == active_nodes_count and active_nodes_count > 0:
+                    is_overall_successful = True
+            else:
+                if successful_nodes_count > 0:
+                    is_overall_successful = True
+
+            return is_overall_successful, "\n".join(report)
 
     except Exception as e:
         logger.error(f"Error in check_ip_ping for {ip} from {location}: {e}")
         return False, f"❌ خطا در ارتباط با API: {e}"
 
-# --- User & Access Management ---
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] User: {user_id} | Action: {action}\n"
-    with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(log_entry)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(log_entry)
+    except Exception as e:
+        logger.error(f"Failed to write to log file: {e}")
 
 def load_users():
     data = load_data(USER_FILE, {"users": {}})
@@ -264,77 +297,6 @@ def reset_user_state(uid, keep_zone=False):
     else:
         user_state.pop(uid, None)
 
-# --- Smart Connection Logic ---
-async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str, record_id: str, user_id: int):
-    record_details = get_record_details(zone_id, record_id)
-    if not record_details: 
-        logger.warning(f"Smart check failed: Record {record_id} not found in zone {zone_id}.")
-        return
-
-    current_ip = record_details['content']
-    settings = load_smart_settings()
-    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
-    
-    check_location = record_config.get("location", "ir") if record_config else "ir"
-
-    is_pinging, report_text = await check_ip_ping(current_ip, check_location)
-    
-    if user_id != 0:
-        await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی دستی IP** `{current_ip}`:\n`{report_text}`", parse_mode="Markdown")
-        if is_pinging:
-            return
-
-    if not is_pinging:
-        ip_lists = load_ip_lists()
-        
-        if current_ip in ip_lists["reserve"]: ip_lists["reserve"].remove(current_ip)
-        if current_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(current_ip)
-
-        notification_text = f"🚨 *گزارش اتصال هوشمند برای `{record_details['name']}`*\n\n"
-        notification_text += f"- آی‌پی فعلی `{current_ip}` از کار افتاد و به لیست منسوخ منتقل شد.\n"
-        
-        new_ip_found = False
-        while ip_lists["reserve"]:
-            next_ip = ip_lists["reserve"].pop(0)
-            
-            if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
-                notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
-                
-                is_next_pinging, _ = await check_ip_ping(next_ip, check_location)
-                
-                if is_next_pinging:
-                    notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
-                    new_ip_found = True
-                    break
-                else:
-                    notification_text += f"❌ تست ناموفق! آی‌پی `{next_ip}` نیز از کار افتاده و به لیست منسوخ منتقل شد.\n"
-                    if next_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(next_ip)
-            else:
-                notification_text += f"- خطا در جایگزینی آی‌پی `{next_ip}`.\n"
-
-        if not new_ip_found:
-            notification_text += "\n🚫 *هشدار:* هیچ آی‌پی سالمی در لیست رزرو باقی نمانده است! لطفاً IP جدید اضافه کنید."
-
-        save_ip_lists(ip_lists)
-        
-        target_chat_id = user_id if user_id != 0 else ADMIN_ID
-        await context.bot.send_message(chat_id=target_chat_id, text=notification_text, parse_mode="Markdown")
-        log_action(user_id or "Auto", f"Smart check for {record_details['name']} completed. IP changed.")
-
-async def run_smart_check_with_semaphore(context, semaphore, zone_id, record_id, user_id):
-    async with semaphore:
-        await run_smart_check_logic(context, zone_id, record_id, user_id)
-
-async def scheduled_job_for_record(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    zone_id = job_data.get("zone_id")
-    record_id = job_data.get("record_id")
-    semaphore = context.bot_data.get("semaphore")
-    
-    logger.info(f"Running scheduled job for record {record_id} in zone {zone_id}")
-    await run_smart_check_with_semaphore(context, semaphore, zone_id, record_id, user_id=0)
-
-# --- Menu and UI Functions ---
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reset_user_state(user_id)
@@ -352,7 +314,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for zone in zones:
             status_icon = "✅" if zone["status"] == "active" else "⏳"
             keyboard.append([InlineKeyboardButton(f"{zone['name']} {status_icon}", callback_data=f"zone_{zone['id']}")])
-    
     action_buttons = [InlineKeyboardButton("🔄 رفرش", callback_data="refresh_domains")]
     if user_id == ADMIN_ID:
         action_buttons.append(InlineKeyboardButton("🗑️ حذف دامنه", callback_data="delete_domain_menu"))
@@ -361,10 +322,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("📜 نمایش لاگ‌ها", callback_data="show_logs"),
         InlineKeyboardButton("ℹ️ راهنما", callback_data="show_help")
     ])
-    
     for i in range(0, len(action_buttons), 2):
         keyboard.append(action_buttons[i:i + 2])
-        
     reply_markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
         await update.effective_message.edit_text(welcome_text, reply_markup=reply_markup)
@@ -399,7 +358,10 @@ async def manage_whitelist_menu(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard.append([InlineKeyboardButton("➕ افزودن کاربر جدید", callback_data="add_user_prompt")])
     keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="manage_users")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.effective_message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    if update.callback_query:
+        await update.effective_message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def manage_user_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -490,7 +452,7 @@ async def show_record_settings(message, uid, zone_id, record_id):
     proxied_status = '✅ فعال' if record.get('proxied') else '❌ غیرفعال'
     text = f"⚙️ تنظیمات رکورد: `{record['name']}`\n\n**Type:** `{record['type']}`\n**Content:** `{record['content']}`\n**TTL:** `{record['ttl']}`\n**Proxied:** {proxied_status}"
     keyboard = [[InlineKeyboardButton("🖊 تغییر IP/Content", callback_data=f"editip_{record_id}"), InlineKeyboardButton("🕒 تغییر TTL", callback_data=f"edittll_{record_id}")],
-                  [InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")]]
+                 [InlineKeyboardButton("🔁 پروکسی", callback_data=f"toggle_proxy_{record_id}")]]
     action_row = []
     if record['type'] == 'A' and record.get('proxied') == False:
         action_row.append(InlineKeyboardButton("🤖 اتصال هوشمند", callback_data=f"smart_menu_{record_id}"))
@@ -507,46 +469,28 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     settings = load_smart_settings()
     record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
     
+    is_auto_check_enabled = record_config is not None
     check_location = record_config.get("location", "ir") if record_config else "ir"
-    interval_seconds = record_config.get("interval") if record_config else 0
-    
+    interval_seconds = record_config.get("interval", 1800) if record_config else 1800
     location_text = "ایران 🇮🇷" if check_location == "ir" else "آلمان 🇩🇪"
+    auto_check_text = "✅ فعال" if is_auto_check_enabled else "❌ غیرفعال"
     
-    if interval_seconds:
-        interval_minutes = interval_seconds / 60
-        auto_check_text = f"✅ فعال (هر {int(interval_minutes)} دقیقه)"
-    else:
-        auto_check_text = "❌ غیرفعال"
-
     record_details = get_record_details(zone_id, record_id)
     text = f"🤖 *منوی اتصال هوشمند برای رکورد: `{record_details.get('name', '')}`*\n\nاین بخش به شما امکان مدیریت و بررسی خودکار IPها را می‌دهد."
     
     keyboard = [
         [InlineKeyboardButton(f"مکان پینگ: {location_text}", callback_data=f"smart_toggle_loc_{record_id}")],
-        [InlineKeyboardButton(f"بررسی خودکار: {auto_check_text}", callback_data=f"smart_schedule_menu_{record_id}")],
+        [InlineKeyboardButton(f"بررسی خودکار: {auto_check_text}", callback_data=f"smart_toggle_auto_{record_id}")],
+        [InlineKeyboardButton(f"زمان‌بندی: هر {interval_to_text(interval_seconds)}", callback_data=f"smart_interval_menu_{record_id}")],
         [InlineKeyboardButton("➕ افزودن IP رزرو", callback_data=f"smart_add_ip_{record_id}")],
         [InlineKeyboardButton("📋 مشاهده IPهای رزرو", callback_data=f"smart_view_reserve_{record_id}")],
         [InlineKeyboardButton("🗑 مشاهده IPهای منسوخ", callback_data=f"smart_view_deprecated_{record_id}")],
         [InlineKeyboardButton("▶️ اجرای بررسی دستی", callback_data=f"smart_run_manual_{record_id}")],
+        [InlineKeyboardButton("🔍 تست سریع", callback_data=f"smart_quick_check_{record_id}")],
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات رکورد", callback_data=f"record_settings_{record_id}")]
     ]
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def show_smart_schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str):
-    text = "⏱ زمان‌بندی بررسی خودکار را انتخاب کنید:"
-    keyboard = [
-        [InlineKeyboardButton("هر ۳۰ دقیقه", callback_data=f"set_schedule_{record_id}_1800")],
-        [InlineKeyboardButton("هر ۱ ساعت", callback_data=f"set_schedule_{record_id}_3600")],
-        [InlineKeyboardButton("هر ۲ ساعت", callback_data=f"set_schedule_{record_id}_7200")],
-        [InlineKeyboardButton("هر ۶ ساعت", callback_data=f"set_schedule_{record_id}_21600")],
-        [InlineKeyboardButton("هر ۱۲ ساعت", callback_data=f"set_schedule_{record_id}_43200")],
-        [InlineKeyboardButton("هر ۲۴ ساعت", callback_data=f"set_schedule_{record_id}_86400")],
-        [InlineKeyboardButton("هر ۴۸ ساعت", callback_data=f"set_schedule_{record_id}_172800")],
-        [InlineKeyboardButton("❌ غیرفعال کردن", callback_data=f"set_schedule_{record_id}_0")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]
-    ]
-    await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = "این ربات برای مدیریت رکوردهای DNS در Cloudflare طراحی شده است."
     await update.effective_message.edit_text(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]))
@@ -602,7 +546,6 @@ async def handle_unauthorized_access_request(update: Update, context: ContextTyp
     else:
         await query.answer("⚠️ شما قبلاً یک درخواست ارسال کرده‌اید.", show_alert=True)
 
-# --- Command and Message Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_user_blocked(user_id): return
@@ -613,18 +556,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if is_user_blocked(uid) or not is_user_authorized(uid):
+    if is_user_blocked(uid): return
+    if not is_user_authorized(uid):
+        await show_request_access_menu(update, context)
         return
 
     state = user_state.get(uid, {})
     mode = state.get("mode")
     text = update.message.text.strip()
-    
-    # Delete the user's message to keep the chat clean
-    await update.message.delete()
-    
-    if not mode or mode == State.NONE:
-        return
+    if not mode or mode == State.NONE: return
 
     if mode == State.ADDING_RESERVE_IP:
         record_id = state.get("record_id")
@@ -641,7 +581,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_ip_lists(ip_lists)
         await update.message.reply_text(f"✅ تعداد {added_count} آی‌پی جدید به لیست رزرو اضافه شد.")
         log_action(uid, f"Added {added_count} new IPs to reserve list.")
-        await show_smart_connection_menu(update.message, context, record_id)
+        q = update.message
+        await show_smart_connection_menu(q, context, record_id)
         return
 
     if mode == State.ADDING_USER and uid == ADMIN_ID:
@@ -656,7 +597,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ شناسه عددی ارسال کنید.")
         finally:
             reset_user_state(uid)
-            await manage_whitelist_menu(update.message, context)
+            q = update.message
+            await manage_whitelist_menu(q, context)
         return
 
     elif mode == State.CLONING_NEW_IP:
@@ -672,7 +614,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e: logger.error(f"Error creating cloned record: {e}"); await update.message.reply_text("❌ خطا در ارتباط با API.")
         finally:
             reset_user_state(uid, keep_zone=True)
-            await show_records_list(update.message, context)
+            q = update.message
+            await show_records_list(q, context)
+            
 
     elif mode == State.EDITING_IP:
         new_content = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
@@ -683,16 +627,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if update_dns_record(zone_id, record_id, record["name"], record["type"], new_content, record["ttl"], record.get("proxied", False)):
                     log_action(uid, f"UPDATE Content for '{record['name']}' to '{new_content}'")
                     await update.message.reply_text("✅ محتوای رکورد با موفقیت به‌روز شد.")
+                    new_msg = await update.message.reply_text("...در حال بارگذاری تنظیمات جدید")
                     reset_user_state(uid, keep_zone=True)
-                    await show_record_settings(update.message, uid, zone_id, record_id)
-                else:
+                    await show_record_settings(new_msg, uid, zone_id, record_id)
+                else: 
                     await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
                     reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
-            else:
+            else: 
                 await update.message.reply_text("❌ رکورد مورد نظر یافت نشد.")
                 reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
-        except Exception as e:
-            logger.error(f"Error updating record: {e}")
+        except Exception: 
             await update.message.reply_text("❌ خطا در ارتباط با API.")
             reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
 
@@ -707,37 +651,103 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"select_ttl_1"), InlineKeyboardButton("2 min", callback_data=f"select_ttl_120")],
             [InlineKeyboardButton("5 min", callback_data=f"select_ttl_300"), InlineKeyboardButton("10 min", callback_data=f"select_ttl_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"select_ttl_3600"), InlineKeyboardButton("1 day", callback_data=f"select_ttl_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await update.message.reply_text("📌 مرحله ۴ از ۵: مقدار TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
-        
-# --- Callback Query Handler ---
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    data = query.data
 
-    if is_user_blocked(uid):
+async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str, record_id: str, user_id: int):
+    record_details = get_record_details(zone_id, record_id)
+    if not record_details: return
+    
+    current_ip = record_details['content']
+    settings = load_smart_settings()
+    record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+    
+    check_location = "ir"
+    if user_id != 0: 
+        manual_record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+        if manual_record_config:
+            check_location = manual_record_config.get("location", "ir")
+    elif record_config:
+        check_location = record_config.get("location", "ir")
+
+    is_pinging, report_text = await check_ip_ping(current_ip, check_location)
+    
+    if user_id != 0: 
+        await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
+        if is_pinging: return
+
+    if not is_pinging:
+        ip_lists = load_ip_lists()
+        
+        if current_ip in ip_lists["reserve"]: ip_lists["reserve"].remove(current_ip)
+        if current_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(current_ip)
+
+        notification_text = f"🚨 *گزارش اتصال هوشمند برای `{record_details['name']}`*\n\n"
+        notification_text += f"- آی‌پی فعلی `{current_ip}` از کار افتاد و به لیست منسوخ منتقل شد.\n"
+        
+        new_ip_found = False
+        while ip_lists["reserve"]:
+            next_ip = ip_lists["reserve"].pop(0)
+            
+            if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
+                notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
+                
+                is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
+                
+                if is_next_pinging:
+                    notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
+                    notification_text += f"\n\n📊 *نتیجه تست آی‌پی جدید:*\n{new_ip_report}"
+                    new_ip_found = True
+                    break
+                else:
+                    notification_text += f"❌ تست ناموفق! آی‌پی `{next_ip}` نیز از کار افتاده و به لیست منسوخ منتقل شد.\n"
+                    if next_ip not in ip_lists["deprecated"]: ip_lists["deprecated"].append(next_ip)
+            else:
+                notification_text += f"- خطا در جایگزینی آی‌پی `{next_ip}`.\n"
+
+        if not new_ip_found:
+            notification_text += "\n🚫 *هشدار:* هیچ آی‌پی سالمی در لیست رزرو باقی نمانده است! لطفاً IP جدید اضافه کنید."
+
+        save_ip_lists(ip_lists)
+        
+        target_chat_id = user_id if user_id != 0 else ADMIN_ID
+        await context.bot.send_message(chat_id=target_chat_id, text=notification_text, parse_mode="Markdown")
+        log_action(user_id or "Auto", f"Smart check for {record_details['name']} completed.")
+
+async def automated_check_job(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Running automated 10-minute check job...")
+    settings = load_smart_settings()
+    auto_check_list = settings.get("auto_check_records", [])
+    if not auto_check_list:
+        logger.info("No records are configured for auto-check.")
         return
+        
+    for record_config in auto_check_list:
+        zone_id = record_config.get("zone_id")
+        record_id = record_config.get("record_id")
+        logger.info(f"Auto-checking record {record_id} in zone {zone_id}...")
+        await run_smart_check_logic(context, zone_id, record_id, user_id=0)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    uid = query.from_user.id; data = query.data
+
+    if is_user_blocked(uid): return
+
+    if data == "request_access":
+        await handle_unauthorized_access_request(update, context); return
 
     if not is_user_authorized(uid):
-        if data == "request_access":
-            await handle_unauthorized_access_request(update, context)
-        else:
-            await show_request_access_menu(update, context)
-        return
-
-    # Admin-only actions
+        await show_request_access_menu(update, context); return
+        
     if data.startswith(('manage_', 'delete_user_', 'block_user_', 'unblock_user_', 'access_', 'add_user_prompt', 'toggle_access_')):
         if uid != ADMIN_ID:
-            await query.answer("شما اجازه دسترسی به این بخش را ندارید.", show_alert=True)
-            return
+            await query.answer("شما اجازه دسترسی به این بخش را ندارید.", show_alert=True); return
         if data == "manage_users": await manage_users_main_menu(update, context)
         elif data == "manage_whitelist": await manage_whitelist_menu(update, context)
         elif data == "manage_blacklist": await manage_blacklist_menu(update, context)
-        elif data == "manage_requests": await manage_requests_menu(update, context)
         elif data.startswith("manage_access_"): await manage_user_access_menu(update, context)
         elif data.startswith("toggle_access_"):
             parts = data.split('_'); target_user_id_str, zone_id_to_toggle = parts[2], parts[3]
@@ -746,107 +756,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 access_list = user_data.get("access", [])
                 if zone_id_to_toggle in access_list:
                     access_list.remove(zone_id_to_toggle)
+                    log_action(uid, f"Revoked access to zone {zone_id_to_toggle} for user {target_user_id_str}")
                 else:
                     access_list.append(zone_id_to_toggle)
+                    log_action(uid, f"Granted access to zone {zone_id_to_toggle} for user {target_user_id_str}")
                 users[target_user_id_str]["access"] = access_list
                 save_users(users)
                 await manage_user_access_menu(update, context)
         elif data.startswith("delete_user_"):
             user_to_manage = int(data.split("_")[2])
-            if remove_user(user_to_manage):
-                await query.answer("کاربر حذف شد.")
+            if remove_user(user_to_manage): log_action(uid, f"Removed user {user_to_manage}."); await query.answer("کاربر حذف شد.")
+            else: await query.answer("عملیات ناموفق بود.", show_alert=True)
             await manage_whitelist_menu(update, context)
         elif data.startswith("block_user_"):
             user_to_manage = int(data.split("_")[2])
-            if block_user(user_to_manage):
-                await query.answer("کاربر مسدود شد.")
+            if block_user(user_to_manage): log_action(uid, f"Blocked user {user_to_manage}."); await query.answer("کاربر مسدود شد.")
+            else: await query.answer("عملیات ناموفق بود.", show_alert=True)
             await manage_whitelist_menu(update, context)
         elif data.startswith("unblock_user_"):
             user_to_manage = int(data.split("_")[2])
-            if unblock_user(user_to_manage):
-                await query.answer("کاربر رفع انسداد شد.")
+            if unblock_user(user_to_manage): log_action(uid, f"Unblocked user {user_to_manage}."); await query.answer("کاربر رفع انسداد شد.")
+            else: await query.answer("عملیات ناموفق بود.", show_alert=True)
             await manage_blacklist_menu(update, context)
         elif data.startswith("access_"):
             action, target_user_id = data.split("_")[1], int(data.split("_")[2])
             if action == "approve":
-                add_user(target_user_id)
-                await context.bot.send_message(chat_id=target_user_id, text="✅ درخواست شما تایید شد. /start")
-                await query.answer("دسترسی تایید شد.")
+                add_user(target_user_id); log_action(uid, f"Approved access for {target_user_id}.")
+                await context.bot.send_message(chat_id=target_user_id, text="✅ درخواست شما تایید شد. /start"); await query.answer("دسترسی تایید شد.")
             elif action == "reject":
-                await context.bot.send_message(chat_id=target_user_id, text="❌ درخواست شما رد شد.")
-                await query.answer("درخواست رد شد.")
+                log_action(uid, f"Rejected access for {target_user_id}.")
+                await context.bot.send_message(chat_id=target_user_id, text="❌ درخواست شما رد شد."); await query.answer("درخواست رد شد.")
             elif action == "block":
-                block_user(target_user_id)
-                await query.answer("کاربر مسدود شد.")
+                block_user(target_user_id); log_action(uid, f"Blocked user {target_user_id}."); await query.answer("کاربر مسدود شد.")
             remove_request(target_user_id)
             await manage_requests_menu(update, context)
         elif data == "add_user_prompt":
             user_state[uid]['mode'] = State.ADDING_USER
-            msg = await query.message.edit_text(
-                "لطفاً شناسه عددی (ID) کاربر را ارسال کنید...",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="manage_whitelist")]])
-            )
-            user_state[uid]['prompt_message_id'] = msg.message_id
+            await query.message.edit_text("لطفاً شناسه عددی (ID) کاربر را ارسال کنید...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="manage_whitelist")]]))
         return
 
-    # General navigation and actions
-    if data == "noop":
-        return
-    
-    state = user_state.get(uid, {})
-    zone_id = state.get("zone_id")
-
-    if data in ["back_to_main", "refresh_domains"]:
-        await show_main_menu(update, context)
-    elif data == "delete_domain_menu":
-        await show_delete_domain_menu(update, context)
-    elif data == "back_to_records" or data == "refresh_records":
-        await show_records_list(update, context)
-    elif data == "show_help":
-        await show_help(update, context)
-    elif data == "show_logs":
-        await show_logs(update, context)
+    state = user_state.get(uid, {}); zone_id = state.get("zone_id")
+    if data == "noop": return
+    if data in ["back_to_main", "refresh_domains"]: await show_main_menu(update, context)
+    elif data == "delete_domain_menu": await show_delete_domain_menu(update, context)
+    elif data == "back_to_records" or data == "refresh_records": await show_records_list(update, context)
+    elif data == "show_help": await show_help(update, context)
+    elif data == "show_logs": await show_logs(update, context)
     elif data == "cancel_action":
-        reset_user_state(uid, keep_zone=True)
-        await query.message.edit_text("❌ عملیات لغو شد.")
-        await show_records_list(update, context)
-    
-    # Zone and Record selection
+        reset_user_state(uid, keep_zone=True); await query.message.edit_text("❌ عملیات لغو شد."); await show_records_list(update.callback_query, context)
     elif data.startswith("zone_"):
-        selected_zone_id = data.split("_")[1]
-        zone_info = get_zone_info_by_id(selected_zone_id)
+        selected_zone_id = data.split("_")[1]; zone_info = get_zone_info_by_id(selected_zone_id)
         if zone_info:
-            user_state[uid].update({"zone_id": selected_zone_id, "zone_name": zone_info["name"]})
-            await show_records_list(update, context)
+            user_state[uid].update({"zone_id": selected_zone_id, "zone_name": zone_info["name"]}); await show_records_list(update, context)
     elif data.startswith("record_settings_"):
-        record_id = data.split("_")[-1]
-        await show_record_settings(query.message, uid, zone_id, record_id)
-
-    # Smart Connection Menu
+        await show_record_settings(query.message, uid, zone_id, data.split("_")[-1])
+    
     elif data.startswith("smart_"):
-        parts = data.split("_")
-        action = parts[1]
-        record_id = parts[-1]
+        parts = data.split("_"); action = parts[1]; record_id = parts[-1]
         user_state[uid]['record_id'] = record_id
-
         if action == "menu":
             await show_smart_connection_menu(update, context, record_id)
-        elif action == "toggle" and parts[2] == "loc":
+        elif action == "toggle":
+            sub_action = parts[2]
             settings = load_smart_settings()
             record_list = settings.setdefault("auto_check_records", [])
             record_config = next((item for item in record_list if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
-            if not record_config:
-                record_list.append({"zone_id": zone_id, "record_id": record_id, "location": "de"})
-            else:
-                record_config["location"] = "de" if record_config.get("location", "ir") == "ir" else "ir"
+            if sub_action == "loc":
+                if not record_config:
+                    record_config = {"zone_id": zone_id, "record_id": record_id, "location": "de"}
+                    record_list.append(record_config)
+                else: record_config["location"] = "de" if record_config.get("location", "ir") == "ir" else "ir"
+            elif sub_action == "auto":
+                if record_config: record_list.remove(record_config)
+                else: record_list.append({"zone_id": zone_id, "record_id": record_id, "location": "ir"})
             save_smart_settings(settings)
             await show_smart_connection_menu(update, context, record_id)
-        elif action == "schedule" and parts[2] == "menu":
-            await show_smart_schedule_menu(update, context, record_id)
         elif action == "add":
-            msg = await query.message.edit_text("➕ لطفاً IP یا IPهای جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]))
             user_state[uid]["mode"] = State.ADDING_RESERVE_IP
-            user_state[uid]["prompt_message_id"] = msg.message_id
+            await query.message.edit_text("➕ لطفاً IP یا IPهای جدید را وارد کنید. می‌توانید چندین IP را با فاصله، کاما یا در خطوط جدید ارسال نمایید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]))
         elif action == "view":
             list_type = parts[2]
             ip_lists = load_ip_lists()
@@ -858,63 +845,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard.insert(0, [InlineKeyboardButton("🗑️ خالی کردن لیست", callback_data=f"smart_clear_deprecated_{record_id}")])
             text += "\n".join(f"`{ip}`" for ip in ip_list) if ip_list else "این لیست خالی است."
             await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        elif action == "clear" and parts[2] == "deprecated":
-            ip_lists = load_ip_lists()
-            ip_lists["deprecated"] = []
-            save_ip_lists(ip_lists)
-            await query.answer("✅ لیست IPهای منسوخ خالی شد.")
+        elif action == "clear":
+            if parts[2] == "deprecated":
+                ip_lists = load_ip_lists()
+                ip_lists["deprecated"] = []
+                save_ip_lists(ip_lists)
+                await query.answer("✅ لیست IPهای منسوخ خالی شد.")
+                log_action(uid, "Cleared deprecated IP list.")
+                await show_smart_connection_menu(update, context, record_id)
+        elif action == "run":
+            await query.message.edit_text(f"⏳ بررسی دستی پینگ شروع شد. لطفاً منتظر بمانید...")
+            await run_smart_check_logic(context, zone_id, record_id, uid)
             await show_smart_connection_menu(update, context, record_id)
-        elif action == "run" and parts[2] == "manual":
-            await query.message.edit_text("⏳ بررسی دستی شروع شد. لطفاً منتظر بمانید...")
-            semaphore = context.bot_data.get("semaphore")
-            await run_smart_check_with_semaphore(context, semaphore, zone_id, record_id, uid)
-            await show_smart_connection_menu(update, context, record_id)
-
-    # Schedule Setting
-    elif data.startswith("set_schedule_"):
-        parts = data.split("_")
-        record_id, interval = parts[2], int(parts[3])
-        settings, record_list = load_smart_settings(), load_smart_settings()["auto_check_records"]
-        record_config = next((item for item in record_list if item["record_id"] == record_id and item.get("zone_id") == zone_id), None)
-        job_name = f"smart_check_{zone_id}_{record_id}"
-        
-        for job in context.job_queue.get_jobs_by_name(job_name):
-            job.schedule_removal()
-
-        if interval > 0:
-            context.job_queue.run_repeating(scheduled_job_for_record, interval=interval, first=10, name=job_name, data={"zone_id": zone_id, "record_id": record_id})
-            if not record_config:
-                record_list.append({"zone_id": zone_id, "record_id": record_id, "interval": interval, "location": "ir"})
-            else:
-                record_config["interval"] = interval
-            await query.answer(f"✅ زمان‌بندی به هر {interval/60:.0f} دقیقه تغییر یافت.")
-        else:
-            if record_config:
-                record_list.remove(record_config)
-            await query.answer("❌ بررسی خودکار غیرفعال شد.")
-        
-        save_smart_settings({"auto_check_records": record_list})
-        await show_smart_connection_menu(update, context, record_id)
-
-    # Record Actions
+        elif action == "quick":
+            await query.message.edit_text(f"⏳ در حال اجرای تست سریع پینگ برای IP `{record_id}`...")
+            record_details = get_record_details(zone_id, record_id)
+            if not record_details: return
+            ip_to_test = record_details['content']
+            
+            settings = load_smart_settings()
+            record_config = next((item for item in settings.get("auto_check_records", []) if item["record_id"] == record_id and item["zone_id"] == zone_id), None)
+            check_location = record_config.get("location", "ir") if record_config else "ir"
+            
+            is_pinging, report_text = await check_ip_ping(ip_to_test, check_location)
+            
+            await query.message.edit_text(f"📊 **نتیجه بررسی IP** `{ip_to_test}`:\n\n{report_text}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]]) )
+            
     elif data.startswith("clone_record_"):
-        record_id = data.split("_")[-1]
-        original_record = get_record_details(zone_id, record_id)
+        record_id = data.split("_")[-1]; original_record = get_record_details(zone_id, record_id)
         if not original_record: await query.answer("❌ رکورد اصلی یافت نشد.", show_alert=True); return
         user_state[uid]["clone_data"] = { "name": original_record["name"], "type": original_record["type"], "ttl": original_record["ttl"], "proxied": original_record.get("proxied", False) }
         user_state[uid]["mode"] = State.CLONING_NEW_IP
-        msg = await query.message.edit_text(f"🐑 **کلون کردن رکورد**\n`{original_record['name']}`\n\nلطفاً **IP جدید** را وارد کنید:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
-        user_state[uid]["prompt_message_id"] = msg.message_id
+        await query.message.edit_text(f"🐑 **کلون کردن رکورد**\n`{original_record['name']}`\n\nلطفاً **IP جدید** را وارد کنید:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("toggle_proxy_"):
-        record_id = data.split("_")[-1]
+        record_id = data.split("_")[-1]; record_details = get_record_details(zone_id, record_id)
         if toggle_proxied_status(zone_id, record_id):
-            await show_record_settings(query.message, uid, zone_id, record_id)
+            log_action(uid, f"Toggled proxy for '{record_details.get('name', record_id)}'"); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.", show_alert=True)
     elif data.startswith("editip_"):
         record_id = data.split("_")[-1]
         user_state[uid].update({"mode": State.EDITING_IP, "record_id": record_id})
-        msg = await query.message.edit_text("📝 لطفاً IP/Content جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
-        user_state[uid]["prompt_message_id"] = msg.message_id
+        await query.message.edit_text("📝 لطفاً IP/Content جدید را وارد کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("edittll_"):
         record_id = data.split("_")[-1]
         keyboard = [
@@ -928,8 +899,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts, record_id, ttl = data.split("_"), data.split("_")[2], int(data.split("_")[3])
         record = get_record_details(zone_id, record_id)
         if record and update_dns_record(zone_id, record_id, record["name"], record["type"], record["content"], ttl, record.get("proxied", False)):
-            await query.answer("✅ TTL تغییر یافت.")
-            await show_record_settings(query.message, uid, zone_id, record_id)
+            log_action(uid, f"Updated TTL for '{record['name']}' to {ttl}"); await query.answer("✅ TTL تغییر یافت."); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.")
     elif data == "add_record":
         user_state[uid]["record_data"] = {}
@@ -941,8 +911,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("📌 مرحله ۱ از ۵: نوع رکورد را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
     elif data.startswith("select_type_"):
         user_state[uid]["record_data"]["type"] = data.split("_")[2]; user_state[uid]["mode"] = State.ADDING_RECORD_NAME
-        msg = await query.message.edit_text("📌 مرحله ۲ از ۵: نام رکورد را وارد کنید (مثال: sub یا @):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
-        user_state[uid]["prompt_message_id"] = msg.message_id
+        await query.message.edit_text("📌 مرحله ۲ از ۵: نام رکورد را وارد کنید (مثال: sub یا @):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
     elif data.startswith("select_ttl_"):
         user_state[uid]["record_data"]["ttl"] = int(data.split("_")[2]); keyboard = [[InlineKeyboardButton("✅ بله", callback_data="select_proxied_true"), InlineKeyboardButton("❌ خیر", callback_data="select_proxied_false")], [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]
         await query.message.edit_text("📌 مرحله ۵ از ۵: آیا پروکسی فعال باشد؟", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -952,6 +921,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_name = f"{r_data['name']}.{zone_name}" if r_data['name'] != "@" else zone_name
         await query.message.edit_text("⏳ در حال ایجاد رکورد...")
         if create_dns_record(zone_id, r_data["type"], full_name, r_data["content"], r_data["ttl"], r_data["proxied"]):
+            log_action(uid, f"CREATE record '{full_name}' with content '{r_data['content']}'")
             await query.message.edit_text("✅ رکورد با موفقیت اضافه شد.")
         else: await query.message.edit_text("❌ افزودن رکورد ناموفق بود.")
         reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
@@ -965,51 +935,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         zone_to_delete_id = data.split("_")[-1]; zone_info = get_zone_info_by_id(zone_to_delete_id); zone_name = zone_info.get("name", "N/A") if zone_info else "N/A"
         await query.message.edit_text(f"⏳ در حال حذف دامنه {zone_name}...")
         if delete_zone(zone_to_delete_id):
-            await query.message.edit_text("✅ دامنه با موفقیت حذف شد.")
+            log_action(uid, f"DELETED ZONE: '{zone_name}'"); await query.message.edit_text("✅ دامنه با موفقیت حذف شد.")
         else: await query.message.edit_text("❌ حذف دامنه ناموفق بود.")
         await show_main_menu(update, context)
     elif data.startswith("delete_record_"):
-        record_id = data.split("_")[-1]
+        record_id = data.split("_")[-1]; 
+        record_details = get_record_details(zone_id, record_id)
         await query.message.edit_text("⏳ در حال حذف رکورد...")
         if delete_dns_record(zone_id, record_id):
+            if record_details: log_action(uid, f"DELETE record '{record_details.get('name', 'N/A')}'")
+            else: log_action(uid, f"DELETE record with ID '{record_id}' (details not found).")
             await query.message.edit_text("✅ رکورد حذف شد.")
         else: await query.message.edit_text("❌ حذف رکورد ناموفق بود.")
         await show_records_list(update, context)
 
-# --- Main Bot Function ---
 def main():
+    load_users(); load_blocked_users(); load_requests(); load_ip_lists(); load_smart_settings()
     logger.info("Starting bot...")
     
     app_builder = Application.builder().token(BOT_TOKEN)
     job_queue = JobQueue()
     app_builder.job_queue(job_queue)
     app = app_builder.build()
-
-    # Create and store the semaphore for rate limiting
-    app.bot_data["semaphore"] = asyncio.Semaphore(5)
-
-    # Load all saved scheduled jobs on startup
-    settings = load_smart_settings()
-    for record_config in settings.get("auto_check_records", []):
-        interval = record_config.get("interval")
-        if interval and interval > 0:
-            zone_id = record_config["zone_id"]
-            record_id = record_config["record_id"]
-            job_name = f"smart_check_{zone_id}_{record_id}"
-            job_queue.run_repeating(
-                scheduled_job_for_record,
-                interval=interval,
-                first=10,
-                name=job_name,
-                data={"zone_id": zone_id, "record_id": record_id}
-            )
-            logger.info(f"Loaded scheduled job '{job_name}' with interval {interval}s.")
-
+    
+    job_queue.run_repeating(automated_check_job, interval=600, first=10)
+    
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("logs", show_logs))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("Bot is running.")
     app.run_polling()
 
 if __name__ == "__main__":
