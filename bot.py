@@ -96,18 +96,18 @@ def save_smart_settings(settings):
     save_data(SMART_SETTINGS_FILE, settings)
 
 async def check_ip_tcp(ip: str, location: str):
-    params = {'host': f"{ip}:{TCP_PORT}", 'node': location}
+    params = {'host': f"{ip}:{TCP_PORT}", 'node': location, 'max_nodes': 10}
     headers = {'Accept': 'application/json'}
-    async with httpx.AsyncClient() as client:
-        try:
+    try:
+        async with httpx.AsyncClient() as client:
             response = await client.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
             response.raise_for_status()
             initial_data = response.json()
             request_id = initial_data.get("request_id")
             nodes_info = initial_data.get("nodes")
             
-            if not request_id:
-                return False, "پاسخ اولیه از API نامعتبر است (request_id یافت نشد)."
+            if not request_id or not nodes_info:
+                return False, "پاسخ اولیه از API نامعتبر است یا اطلاعات نودها یافت نشد."
 
             await asyncio.sleep(10)
             
@@ -116,9 +116,6 @@ async def check_ip_tcp(ip: str, location: str):
             result_response.raise_for_status()
             results = result_response.json()
             
-            if not nodes_info:
-                return False, "اطلاعات نودها در پاسخ اولیه یافت نشد."
-
             report = []
             is_overall_successful = False
             active_nodes_count = 0
@@ -170,9 +167,9 @@ async def check_ip_tcp(ip: str, location: str):
 
             return is_overall_successful, "\n".join(report)
 
-        except Exception as e:
-            logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
-            return False, f"❌ خطا در ارتباط با API: {e}"
+    except Exception as e:
+        logger.error(f"Error in check_ip_tcp for {ip}:{TCP_PORT} from {location}: {e}")
+        return False, f"❌ خطا در ارتباط با API: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -643,9 +640,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[uid]["record_data"]["content"] = text
         user_state[uid].pop("mode", None)
         keyboard = [
-            [InlineKeyboardButton("Auto", callback_data="select_ttl_1"), InlineKeyboardButton("2 min", callback_data="select_ttl_120")],
-            [InlineKeyboardButton("5 min", callback_data="select_ttl_300"), InlineKeyboardButton("10 min", callback_data="select_ttl_600")],
-            [InlineKeyboardButton("1 hr", callback_data="select_ttl_3600"), InlineKeyboardButton("1 day", callback_data="select_ttl_86400")],
+            [InlineKeyboardButton("Auto", callback_data=f"select_ttl_1"), InlineKeyboardButton("2 min", callback_data=f"select_ttl_120")],
+            [InlineKeyboardButton("5 min", callback_data=f"select_ttl_300"), InlineKeyboardButton("10 min", callback_data=f"select_ttl_600")],
+            [InlineKeyboardButton("1 hr", callback_data=f"select_ttl_3600"), InlineKeyboardButton("1 day", callback_data=f"select_ttl_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await update.message.reply_text("📌 مرحله ۴ از ۵: مقدار TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -797,7 +794,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "show_help": await show_help(update, context)
     elif data == "show_logs": await show_logs(update, context)
     elif data == "cancel_action":
-        reset_user_state(uid, keep_zone=True); await query.message.edit_text("❌ عملیات لغو شد."); await show_records_list(update, context)
+        reset_user_state(uid, keep_zone=True); await query.message.edit_text("❌ عملیات لغو شد."); await show_records_list(update.callback_query, context)
     elif data.startswith("zone_"):
         selected_zone_id = data.split("_")[1]; zone_info = get_zone_info_by_id(selected_zone_id)
         if zone_info:
