@@ -5,6 +5,7 @@ SERVICE_NAME="cloudflarebot"
 # At the very beginning of setup.sh
 if [ -d "$INSTALL_DIR/.git" ]; then
   cd "$INSTALL_DIR" || exit
+  # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
   git reset --hard origin/main
   git pull origin main
   cd - || exit
@@ -56,15 +57,9 @@ update_bot() {
   else
     echo "🔄 Updating the bot to the latest version..."
     cd "$INSTALL_DIR" || exit
+    # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
     git reset --hard origin/main
     git pull origin main
-    # Reinstall dependencies in case they've changed
-    if [ -f "requirements.txt" ]; then
-      echo "📦 Reinstalling dependencies from requirements.txt..."
-      source venv/bin/activate
-      pip install -r requirements.txt
-      deactivate
-    fi
     echo "🔄 Restarting the bot service..."
     systemctl restart "$SERVICE_NAME"
     echo "✅ Bot updated and restarted successfully."
