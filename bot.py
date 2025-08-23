@@ -65,6 +65,7 @@ IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
 CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
+TCP_PORT = 443 
 
 user_state = defaultdict(dict)
 
@@ -94,11 +95,11 @@ def load_smart_settings():
 def save_smart_settings(settings):
     save_data(SMART_SETTINGS_FILE, settings)
 
-async def check_ip_ping(ip: str, location: str):
-    params = {'host': ip, 'node': location}
+async def check_ip_tcp(ip: str, location: str, port: int):
+    params = {'host': f"{ip}:{port}", 'node': location}
     headers = {'Accept': 'application/json'}
     try:
-        response = requests.get("https://check-host.net/check-ping", params=params, headers=headers, timeout=10)
+        response = requests.get("https://check-host.net/check-tcp", params=params, headers=headers, timeout=10)
         response.raise_for_status()
         initial_data = response.json()
         request_id = initial_data.get("request_id")
@@ -113,9 +114,11 @@ async def check_ip_ping(ip: str, location: str):
         result_response = requests.get(result_url, headers=headers, timeout=20)
         result_response.raise_for_status()
         results = result_response.json()
-
+        
         report = []
         is_overall_successful = False
+        total_nodes = 0
+        successful_nodes = 0
 
         for node_key, ping_results in results.items():
             if node_key not in nodes_info:
@@ -127,6 +130,8 @@ async def check_ip_ping(ip: str, location: str):
             if location.lower() != node_country_code.lower():
                 continue
             
+            total_nodes += 1
+
             if ping_results is None:
                 report.append(f"⏳ {node_city}: در حال بررسی...")
                 continue
@@ -144,21 +149,27 @@ async def check_ip_ping(ip: str, location: str):
                         total_time += single_ping[1]
                 
                 if packets_received > 0:
-                    is_overall_successful = True
+                    successful_nodes += 1
                     avg_ping = total_time / packets_received
-                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} | میانگین: {avg_ping:.3f} ثانیه")
+                    report.append(f"✅ {node_city}: {packets_received}/{packets_sent} packets | میانگین: {avg_ping:.3f} ms")
                 else:
-                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent}")
+                    report.append(f"❌ {node_city}: {packets_received}/{packets_sent} packets")
         
         if not report:
             report.append("🚫 هیچ نتیجه‌ای از نودهای مربوطه دریافت نشد.")
+        
+        if location.lower() == "ir":
+            if successful_nodes == total_nodes and total_nodes > 0:
+                is_overall_successful = True
+        else:
+            if successful_nodes > 0:
+                is_overall_successful = True
 
         return is_overall_successful, "\n".join(report)
 
     except Exception as e:
-        logger.error(f"Error in check_ip_ping for {ip} from {location}: {e}")
-        return False, f"❌ خطا در ارتباط با API: {e}"
-
+        logger.error(f"Error in check_ip_tcp for {ip}:{port} from {location}: {e}")
+        return False, f"❌ خطا در بررسی پینگ: {e}"
 
 def log_action(user_id: int, action: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -649,7 +660,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
     elif record_config:
         check_location = record_config.get("location", "ir")
 
-    is_pinging, report_text = await check_ip_ping(current_ip, check_location)
+    is_pinging, report_text = await check_ip_tcp(current_ip, check_location, TCP_PORT)
     
     if user_id != 0: 
         await context.bot.send_message(chat_id=user_id, text=f"📊 **نتیجه بررسی IP** `{current_ip}`:\n{report_text}", parse_mode="Markdown")
@@ -671,7 +682,7 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
             if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
                 notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
                 
-                is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
+                is_next_pinging, new_ip_report = await check_ip_tcp(next_ip, check_location, TCP_PORT)
                 
                 if is_next_pinging:
                     notification_text += f"✅ تست موفق! آی‌پی `{next_ip}` اکنون فعال است."
@@ -725,7 +736,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "manage_users": await manage_users_main_menu(update, context)
         elif data == "manage_whitelist": await manage_whitelist_menu(update, context)
         elif data == "manage_blacklist": await manage_blacklist_menu(update, context)
-        elif data == "manage_requests": await manage_requests_menu(update, context)
         elif data.startswith("manage_access_"): await manage_user_access_menu(update, context)
         elif data.startswith("toggle_access_"):
             parts = data.split('_'); target_user_id_str, zone_id_to_toggle = parts[2], parts[3]
@@ -832,7 +842,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log_action(uid, "Cleared deprecated IP list.")
                 await show_smart_connection_menu(update, context, record_id)
         elif action == "run":
-            await query.message.edit_text("⏳ بررسی دستی شروع شد. لطفاً منتظر بمانید...")
+            await query.message.edit_text(f"⏳ بررسی دستی TCP پورت {TCP_PORT} شروع شد. لطفاً منتظر بمانید...")
             await run_smart_check_logic(context, zone_id, record_id, uid)
             await show_smart_connection_menu(update, context, record_id)
 
