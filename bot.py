@@ -64,7 +64,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
 
 user_state = defaultdict(dict)
 
@@ -461,6 +461,7 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     
     is_auto_check_enabled = record_config is not None
     check_location = record_config.get("location", "ir") if record_config else "ir"
+    interval_seconds = record_config.get("interval", 1800) if record_config else 1800
     location_text = "ایران 🇮🇷" if check_location == "ir" else "آلمان 🇩🇪"
     auto_check_text = "✅ فعال" if is_auto_check_enabled else "❌ غیرفعال"
     
@@ -469,7 +470,8 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     
     keyboard = [
         [InlineKeyboardButton(f"مکان پینگ: {location_text}", callback_data=f"smart_toggle_loc_{record_id}")],
-        [InlineKeyboardButton(f"بررسی خودکار (۱۰ دقیقه): {auto_check_text}", callback_data=f"smart_toggle_auto_{record_id}")],
+        [InlineKeyboardButton(f"بررسی خودکار: {auto_check_text}", callback_data=f"smart_toggle_auto_{record_id}")],
+        [InlineKeyboardButton(f"زمان‌بندی: هر {interval_to_text(interval_seconds)}", callback_data=f"smart_interval_menu_{record_id}")],
         [InlineKeyboardButton("➕ افزودن IP رزرو", callback_data=f"smart_add_ip_{record_id}")],
         [InlineKeyboardButton("📋 مشاهده IPهای رزرو", callback_data=f"smart_view_reserve_{record_id}")],
         [InlineKeyboardButton("🗑 مشاهده IPهای منسوخ", callback_data=f"smart_view_deprecated_{record_id}")],
@@ -879,7 +881,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("2 min", callback_data=f"update_ttl_{record_id}_120")],
             [InlineKeyboardButton("5 min", callback_data=f"update_ttl_{record_id}_300"), InlineKeyboardButton("10 min", callback_data=f"update_ttl_{record_id}_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback=f"update_ttl_{record_id}_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_{record_id}_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
