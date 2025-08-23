@@ -31,8 +31,7 @@ echo "🐍 Creating virtual environment and installing packages..."
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install python-telegram-bot[job-queue]==20.7
-pip install httpx
+pip install -r requirements.txt
 deactivate
 
 echo "✅ Python packages installed successfully."
