@@ -131,12 +131,8 @@ async def check_ip_tcp(ip: str, location: str):
                 active_nodes_count += 1
                 ping_results = results.get(node_key)
                 
-                if ping_results is None:
-                    report.append(f"⏳ {node_city}: در حال بررسی...")
-                    continue
-                
-                if ping_results == [[None]] or not isinstance(ping_results, list) or not ping_results or not isinstance(ping_results[0], list):
-                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ نامعتبر)")
+                if not ping_results or not isinstance(ping_results, list) or not ping_results[0] or not isinstance(ping_results[0], list):
+                    report.append(f"❌ {node_city}: تست ناموفق (پاسخ خالی یا نامعتبر)")
                     continue
 
                 packets_sent = len(ping_results[0])
@@ -642,7 +638,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"select_ttl_1"), InlineKeyboardButton("2 min", callback_data=f"select_ttl_120")],
             [InlineKeyboardButton("5 min", callback_data=f"select_ttl_300"), InlineKeyboardButton("10 min", callback_data=f"select_ttl_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"select_ttl_3600"), InlineKeyboardButton("1 day", callback_data=f"select_ttl_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await update.message.reply_text("📌 مرحله ۴ از ۵: مقدار TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -882,7 +878,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("Auto", callback_data=f"update_ttl_{record_id}_1"), InlineKeyboardButton("2 min", callback_data=f"update_ttl_{record_id}_120")],
             [InlineKeyboardButton("5 min", callback_data=f"update_ttl_{record_id}_300"), InlineKeyboardButton("10 min", callback_data=f"update_ttl_{record_id}_600")],
-            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback_data=f"update_ttl_{record_id}_86400")],
+            [InlineKeyboardButton("1 hr", callback_data=f"update_ttl_{record_id}_3600"), InlineKeyboardButton("1 day", callback=f"update_ttl_{record_id}_86400")],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]
         ]
         await query.message.edit_text("⏱ مقدار جدید TTL را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
