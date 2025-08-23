@@ -64,7 +64,7 @@ REQUEST_FILE = "access_requests.json"
 IP_LIST_FILE = "smart_connect_ips.json"
 SMART_SETTINGS_FILE = "smart_connect_settings.json"
 
-CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"]
+CLEAN_IP_SOURCE = ["8.8.8.8", "8.8.4.4", "185.235.195.1", "185.235.195.2", "45.87.65.1", "45.87.65.2"] 
 
 user_state = defaultdict(dict)
 
@@ -486,7 +486,6 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
         [InlineKeyboardButton("📋 مشاهده IPهای رزرو", callback_data=f"smart_view_reserve_{record_id}")],
         [InlineKeyboardButton("🗑 مشاهده IPهای منسوخ", callback_data=f"smart_view_deprecated_{record_id}")],
         [InlineKeyboardButton("▶️ اجرای بررسی دستی", callback_data=f"smart_run_manual_{record_id}")],
-        [InlineKeyboardButton("🔍 تست سریع", callback_data=f"smart_quick_check_{record_id}")],
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات رکورد", callback_data=f"record_settings_{record_id}")]
     ]
     await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -717,18 +716,11 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
         log_action(user_id or "Auto", f"Smart check for {record_details['name']} completed.")
 
 async def automated_check_job(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Running automated 10-minute check job...")
-    settings = load_smart_settings()
-    auto_check_list = settings.get("auto_check_records", [])
-    if not auto_check_list:
-        logger.info("No records are configured for auto-check.")
-        return
-        
-    for record_config in auto_check_list:
-        zone_id = record_config.get("zone_id")
-        record_id = record_config.get("record_id")
-        logger.info(f"Auto-checking record {record_id} in zone {zone_id}...")
-        await run_smart_check_logic(context, zone_id, record_id, user_id=0)
+    job = context.job
+    zone_id = job.data["zone_id"]
+    record_id = job.data["record_id"]
+    logger.info(f"Running job for record {record_id}...")
+    await run_smart_check_logic(context, zone_id, record_id, user_id=0)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -958,7 +950,17 @@ def main():
     app_builder.job_queue(job_queue)
     app = app_builder.build()
     
-    job_queue.run_repeating(automated_check_job, interval=600, first=10)
+    # Schedule jobs for all auto-check records at startup
+    settings = load_smart_settings()
+    auto_check_list = settings.get("auto_check_records", [])
+    for record_config in auto_check_list:
+        zone_id = record_config.get("zone_id")
+        record_id = record_config.get("record_id")
+        interval = record_config.get("interval", 1800)
+        job_name = f"smart_check_{zone_id}_{record_id}"
+        context_data = {"zone_id": zone_id, "record_id": record_id}
+        job_queue.run_repeating(automated_check_job, interval=interval, first=10, name=job_name, data=context_data)
+        logger.info(f"Scheduled job for record {record_id} every {interval} seconds.")
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("logs", show_logs))
