@@ -60,6 +60,16 @@ update_bot() {
     # این خط را اضافه می کنیم تا تغییرات محلی را نادیده بگیرد و نسخه اصلی را دریافت کند
     git reset --hard origin/main
     git pull origin main
+
+    # مطمئن شو وابستگی‌ها بعد از آپدیت نصب/آپدیت شده‌اند (مثلاً اضافه‌شدن requests)
+    if [ -d "venv" ] && [ -f "venv/bin/activate" ]; then
+      echo "📦 Installing/updating Python dependencies..."
+      source venv/bin/activate
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      deactivate
+    fi
+
     echo "🔄 Restarting the bot service..."
     systemctl restart "$SERVICE_NAME"
     echo "✅ Bot updated and restarted successfully."

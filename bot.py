@@ -10,49 +10,38 @@ from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue)
 
+# --- Configuration & Cloudflare API imports ---
+#
+# نکته مهم:
+# قبلاً اگر هرکدام از ایمپورت‌ها خطا می‌داد (مثلاً نبودن پکیج requests)،
+# پروژه می‌رفت روی حالت Mock و BOT_TOKEN هم تبدیل می‌شد به YOUR_BOT_TOKEN_HERE.
+# نتیجه‌اش این بود که تلگرام توکن را رد می‌کرد و عیب‌یابی سخت می‌شد.
+#
+# اینجا عمداً Fail-Fast می‌کنیم تا خطای واقعی دقیقاً در لاگ مشخص باشد.
 try:
-    from cloudflare_api import *
     from config import BOT_TOKEN, ADMIN_ID
-except ImportError:
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-    ADMIN_ID = 123456789
-    MOCKED_ZONES = {
-        "zone1": {"id": "zone1", "name": "example.com", "status": "active"},
-        "zone2": {"id": "zone2", "name": "mysite.org", "status": "active"},
-        "zone3": {"id": "zone3", "name": "anothersite.net", "status": "pending"}
-    }
-    MOCKED_RECORDS = {
-        "zone1": [
-            {"id": "rec1", "type": "A", "name": "test.example.com", "content": "1.1.1.1"},
-            {"id": "rec2", "type": "CNAME", "name": "www.example.com", "content": "example.com"},
-        ],
-        "zone2": [
-            {"id": "rec4", "type": "AAAA", "name": "ipv6.mysite.org", "content": "2001:db8::1"}
-        ],
-         "zone3": []
-    }
-    def get_zones(): return list(MOCKED_ZONES.values())
-    def get_dns_records(zone_id): return MOCKED_RECORDS.get(zone_id, [])
-    def get_record_details(zone_id, record_id):
-        for rec in MOCKED_RECORDS.get(zone_id, []):
-            if rec["id"] == record_id:
-                return {**rec, "ttl": 1, "proxied": False}
-        return None
-    def get_zone_info_by_id(zone_id): return MOCKED_ZONES.get(zone_id)
-    def create_dns_record(zone_id, type, name, content, ttl, proxied): return True
-    def update_dns_record(zone_id, record_id, name, type, content, ttl, proxied):
-        for rec in MOCKED_RECORDS.get(zone_id, []):
-            if rec["id"] == record_id:
-                rec["content"] = content
-                return True
-        return False
-    def delete_dns_record(zone_id, record_id): return True
-    def toggle_proxied_status(zone_id, record_id): return True
-    def delete_zone(zone_id):
-        if zone_id in MOCKED_ZONES:
-            del MOCKED_ZONES[zone_id]
-            return True
-        return False
+except Exception as e:
+    raise RuntimeError(
+        "config.py پیدا نشد یا نامعتبر است. فایل config.py.template را به config.py کپی کنید و مقادیر را کامل کنید."
+    ) from e
+
+# اعتبارسنجی مقادیر تنظیمات (کمک می‌کند خطاها زودتر و واضح‌تر دیده شوند)
+try:
+    ADMIN_ID = int(ADMIN_ID)
+except Exception as e:
+    raise RuntimeError("ADMIN_ID باید یک عدد (Telegram Numeric ID) باشد.") from e
+
+if not isinstance(BOT_TOKEN, str) or not BOT_TOKEN.strip() or BOT_TOKEN.strip() == "YOUR_BOT_TOKEN_HERE":
+    raise RuntimeError(
+        "BOT_TOKEN تنظیم نشده یا نامعتبر است. لطفاً در فایل config.py توکن صحیح BotFather را قرار دهید."
+    )
+
+try:
+    from cloudflare_api import *  # noqa: F401,F403
+except Exception as e:
+    raise RuntimeError(
+        "ایمپورت cloudflare_api ناموفق بود. لطفاً مطمئن شوید پکیج‌ها نصب هستند: pip install -r requirements.txt (خصوصاً requests)."
+    ) from e
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -488,7 +477,13 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
         [InlineKeyboardButton("▶️ اجرای بررسی دستی", callback_data=f"smart_run_manual_{record_id}")],
         [InlineKeyboardButton("🔙 بازگشت به تنظیمات رکورد", callback_data=f"record_settings_{record_id}")]
     ]
-    await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    # اگر این منو از طریق کلیک روی دکمه‌ها باز شده باشد، پیام قبلی را ادیت می‌کنیم.
+    # اما اگر از طریق ارسال متن (MessageHandler) فراخوانی شود، باید پیام جدید ارسال کنیم
+    # چون بات اجازه ادیت پیام کاربر را ندارد.
+    if update.callback_query:
+        await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_interval_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str):
     text = "⏱️ لطفا بازه زمانی برای بررسی خودکار را انتخاب کنید:"
@@ -510,7 +505,10 @@ async def show_interval_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
         ],
         [InlineKeyboardButton("🔙 بازگشت", callback_data=f"smart_menu_{record_id}")]
     ]
-    await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.callback_query:
+        await update.effective_message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = "این ربات برای مدیریت رکوردهای DNS در Cloudflare طراحی شده است."
@@ -602,8 +600,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_ip_lists(ip_lists)
         await update.message.reply_text(f"✅ تعداد {added_count} آی‌پی جدید به لیست رزرو اضافه شد.")
         log_action(uid, f"Added {added_count} new IPs to reserve list.")
-        q = update.message
-        await show_smart_connection_menu(q, context, record_id)
+        # خروج از حالت دریافت IP و بازگشت خودکار به منوی قبلی
+        reset_user_state(uid, keep_zone=True)
+        await show_smart_connection_menu(update, context, record_id)
         return
 
     if mode == State.ADDING_USER and uid == ADMIN_ID:
@@ -618,8 +617,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ شناسه عددی ارسال کنید.")
         finally:
             reset_user_state(uid)
-            q = update.message
-            await manage_whitelist_menu(q, context)
+            await manage_whitelist_menu(update, context)
         return
 
     elif mode == State.CLONING_NEW_IP:
@@ -634,9 +632,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: await update.message.reply_text("❌ عملیات ناموفق بود.")
         except Exception as e: logger.error(f"Error creating cloned record: {e}"); await update.message.reply_text("❌ خطا در ارتباط با API.")
         finally:
+            # بازگشت خودکار به منوی قبلی (تنظیمات همان رکورد)
+            original_record_id = state.get("record_id")
             reset_user_state(uid, keep_zone=True)
-            q = update.message
-            await show_records_list(q, context)
+            if original_record_id and zone_id:
+                new_msg = await update.message.reply_text("↩️ بازگشت به منوی رکورد...")
+                await show_record_settings(new_msg, uid, zone_id, original_record_id)
+            else:
+                await show_records_list(update, context)
+        return
             
 
     elif mode == State.EDITING_IP:
@@ -653,13 +657,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await show_record_settings(new_msg, uid, zone_id, record_id)
                 else: 
                     await update.message.reply_text("❌ به‌روزرسانی ناموفق بود.")
-                    reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
+                    reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
             else: 
                 await update.message.reply_text("❌ رکورد مورد نظر یافت نشد.")
-                reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
+                reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
         except Exception: 
             await update.message.reply_text("❌ خطا در ارتباط با API.")
-            reset_user_state(uid, keep_zone=True); await show_records_list(update.message, context)
+            reset_user_state(uid, keep_zone=True); await show_records_list(update, context)
 
     elif mode == State.ADDING_RECORD_NAME:
         user_state[uid]["record_data"]["name"] = text
@@ -817,7 +821,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "show_help": await show_help(update, context)
     elif data == "show_logs": await show_logs(update, context)
     elif data == "cancel_action":
-        reset_user_state(uid, keep_zone=True); await query.message.edit_text("❌ عملیات لغو شد."); await show_records_list(update.callback_query, context)
+        # بازگشت خودکار به لیست رکوردها
+        reset_user_state(uid, keep_zone=True)
+        await query.message.edit_text("❌ عملیات لغو شد.")
+        await show_records_list(update, context)
     elif data.startswith("zone_"):
         selected_zone_id = data.split("_")[1]; zone_info = get_zone_info_by_id(selected_zone_id)
         if zone_info:
