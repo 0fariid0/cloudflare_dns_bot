@@ -1,4 +1,15 @@
+# Telegram bot token from BotFather
 BOT_TOKEN = ""
+
+# Cloudflare credentials:
+# - Recommended: create an **API Token** with permissions:
+#     Zone → Zone → Read
+#     Zone → DNS → Edit
+#   Put that token in CLOUDFLARE_API_KEY. CLOUDFLARE_EMAIL can be empty.
+# - Alternative: use **Global API Key** (legacy):
+#   Set CLOUDFLARE_EMAIL and the Global API Key in CLOUDFLARE_API_KEY.
 CLOUDFLARE_EMAIL = ""
 CLOUDFLARE_API_KEY = ""
+
+# Telegram numeric ID of the bot admin (owner)
 ADMIN_ID = ""

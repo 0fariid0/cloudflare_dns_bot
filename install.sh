@@ -2,13 +2,18 @@
 
 set -e
 
-echo "🚀 Cloudflare DNS Telegram"
+echo "🚀 Cloudflare DNS Telegram Bot Installer"
+
+echo ""
+echo "ℹ️ نکته: Cloudflare API Token (پیشنهادی) با هدر Authorization: Bearer کار می‌کند."
+echo "   اگر Global API Key (قدیمی) استفاده می‌کنید، ایمیل Cloudflare هم لازم است."
+echo ""
 
 # گرفتن اطلاعات از کاربر
 read -p "Enter Bot Token: " bot_token
-read -p "Enter CLOUDFLARE_EMAIL : " cf_email
-read -p "Enter CLOUDFLARE_API_KEY: " cf_api
-read -p "Enter ID_number Admin (EX'5123552') : " admin_id
+read -p "Enter CLOUDFLARE API Token (recommended) OR Global API Key: " cf_api
+read -p "Enter CLOUDFLARE_EMAIL (only for Global API Key; press Enter to skip): " cf_email
+read -p "Enter Admin Telegram numeric ID (EX '5123552'): " admin_id
 
 # کپی فایل config.py از template
 cp config.py.template config.py

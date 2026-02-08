@@ -297,7 +297,23 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     keyboard = []
     if not zones:
-        welcome_text = "شما به هیچ دامنه‌ای دسترسی ندارید."
+        # اگر لیست دامنه‌ها خالی است، ممکن است واقعاً دامنه‌ای نداشته باشید یا
+        # ممکن است مشکل دسترسی/توکن Cloudflare باشد.
+        cf_err = None
+        try:
+            cf_err = get_last_error()
+        except Exception:
+            cf_err = None
+        if cf_err:
+            welcome_text = (
+                "❌ خطا در دریافت دامنه‌ها از Cloudflare:\n\n"
+                f"{cf_err}\n\n"
+                "✅ اگر از API Token استفاده می‌کنید، مطمئن شوید دسترسی‌های زیر را داده‌اید:\n"
+                "- Zone → Zone → Read\n"
+                "- Zone → DNS → Edit"
+            )
+        else:
+            welcome_text = "شما به هیچ دامنه‌ای دسترسی ندارید."
     else:
         welcome_text = "👋 به ربات مدیریت DNS خوش آمدید!\n\n🌐 برای مدیریت رکوردها، دامنه خود را انتخاب کنید:"
         for zone in zones:
@@ -354,8 +370,21 @@ async def manage_whitelist_menu(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def manage_user_access_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    target_user_id = int(query.data.split('_')[2])
+    target_user_id = int(query.data.split("_")[2])
     all_zones = get_zones()
+    if not all_zones:
+        cf_err = None
+        try:
+            cf_err = get_last_error()
+        except Exception:
+            cf_err = None
+        if cf_err:
+            await query.message.edit_text(
+                f"❌ خطا در دریافت دامنه‌ها از Cloudflare\n\n{cf_err}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="manage_whitelist")]]),
+            )
+            return
+
     users = load_users()
     user_access = users.get(str(target_user_id), {}).get("access", [])
     text = f"🔑 *مدیریت دسترسی برای کاربر `{target_user_id}`*\n\n"
@@ -401,7 +430,21 @@ async def manage_requests_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 async def show_delete_domain_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zones = get_zones()
     if not zones:
-        await update.effective_message.edit_text("هیچ دامنه‌ای برای حذف یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]))
+        cf_err = None
+        try:
+            cf_err = get_last_error()
+        except Exception:
+            cf_err = None
+        if cf_err:
+            await update.effective_message.edit_text(
+                f"❌ خطا در دریافت دامنه‌ها از Cloudflare\n\n{cf_err}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]),
+            )
+        else:
+            await update.effective_message.edit_text(
+                "هیچ دامنه‌ای برای حذف یافت نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]),
+            )
         return
     keyboard = [[InlineKeyboardButton(f"🗑️ {z['name']}", callback_data=f"confirm_delete_zone_{z['id']}")] for z in zones]
     keyboard.append([InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back_to_main")])
@@ -415,6 +458,20 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.edit_text("خطا: دامنه انتخاب نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back_to_main")]]))
         return
     records = get_dns_records(zone_id)
+    if not records:
+        cf_err = None
+        try:
+            cf_err = get_last_error()
+        except Exception:
+            cf_err = None
+        if cf_err:
+            err_text = f"❌ خطا در دریافت رکوردها از Cloudflare\n\n{cf_err}"
+            err_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به دامنه‌ها", callback_data="back_to_main")]])
+            if update.callback_query:
+                await update.effective_message.edit_text(err_text, reply_markup=err_kb)
+            else:
+                await context.bot.send_message(chat_id=uid, text=err_text, reply_markup=err_kb)
+            return
     text = f"📋 رکوردهای DNS دامنه: `{zone_name}`\n\n"
     keyboard = []
     supported_types = ["A", "AAAA", "CNAME"]
@@ -435,7 +492,21 @@ async def show_records_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_record_settings(message, uid, zone_id, record_id):
     record = get_record_details(zone_id, record_id)
     if not record:
-        await message.edit_text("❌ رکورد یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back_to_records")]]))
+        cf_err = None
+        try:
+            cf_err = get_last_error()
+        except Exception:
+            cf_err = None
+        if cf_err:
+            await message.edit_text(
+                f"❌ خطا در دریافت اطلاعات رکورد از Cloudflare\n\n{cf_err}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back_to_records")]]),
+            )
+        else:
+            await message.edit_text(
+                "❌ رکورد یافت نشد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back_to_records")]]),
+            )
         return
     user_state[uid]["record_id"] = record_id
     proxied_status = '✅ فعال' if record.get('proxied') else '❌ غیرفعال'
