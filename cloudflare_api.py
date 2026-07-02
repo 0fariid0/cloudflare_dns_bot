@@ -1,48 +1,53 @@
 """Cloudflare API wrapper used by the Telegram bot.
 
-This project originally authenticated using Cloudflare **Global API Key**:
-    X-Auth-Email + X-Auth-Key
+Supports both authentication modes:
+- Recommended API Token: Authorization: Bearer <token>
+- Legacy Global API Key: X-Auth-Email + X-Auth-Key
 
-However, Cloudflare **API Tokens** (recommended) must be sent as:
-    Authorization: Bearer <token>
-
-This module supports BOTH modes automatically:
-- If CLOUDFLARE_API_KEY *looks like* a Global API Key (37 hex chars) AND
-  CLOUDFLARE_EMAIL is set -> uses X-Auth-Email / X-Auth-Key
-- Otherwise -> treats CLOUDFLARE_API_KEY as an API Token and uses Bearer
-
-All public functions keep the original signatures used by bot.py.
+The public function names are kept compatible with bot.py.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.cloudflare.com/client/v4"
-_DEFAULT_TIMEOUT = 20
+_DEFAULT_TIMEOUT: Tuple[int, int] = (8, 25)
+_CACHE_TTL_SECONDS = 20
 
 # Stores the last Cloudflare error message (used by the bot UI to show a helpful message)
 _LAST_ERROR: Optional[str] = None
-
-def get_last_error() -> Optional[str]:
-    """Return last Cloudflare API error message (if any)."""
-    return _LAST_ERROR
-
-def _set_last_error(err: Optional[str]) -> None:
-    global _LAST_ERROR
-    _LAST_ERROR = err
-
+_ZONES_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_RECORDS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # Cloudflare Global API Key is 37 hex characters.
 _GLOBAL_KEY_RE = re.compile(r"^[a-f0-9]{37}$", re.IGNORECASE)
+
+_SESSION = requests.Session()
+_RETRY = Retry(
+    total=2,
+    connect=2,
+    read=2,
+    status=2,
+    backoff_factor=0.35,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+    raise_on_status=False,
+)
+_ADAPTER = HTTPAdapter(max_retries=_RETRY, pool_connections=10, pool_maxsize=20)
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
 
 
 class CloudflareAPIError(RuntimeError):
@@ -50,6 +55,41 @@ class CloudflareAPIError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.errors = errors or []
+
+
+def get_last_error() -> Optional[str]:
+    """Return last Cloudflare API error message (if any)."""
+    return _LAST_ERROR
+
+
+def _set_last_error(err: Optional[str]) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = err
+
+
+def _cache_get(cache: Dict[str, Any], key: str = "data"):
+    if cache.get(key) is None:
+        return None
+    if time.monotonic() - float(cache.get("ts", 0)) > _CACHE_TTL_SECONDS:
+        return None
+    return cache.get(key)
+
+
+def _cache_set(cache: Dict[str, Any], data, key: str = "data") -> None:
+    cache["ts"] = time.monotonic()
+    cache[key] = data
+
+
+def _invalidate_zones_cache() -> None:
+    _ZONES_CACHE["ts"] = 0.0
+    _ZONES_CACHE["data"] = None
+
+
+def _invalidate_records_cache(zone_id: Optional[str] = None) -> None:
+    if zone_id:
+        _RECORDS_CACHE.pop(zone_id, None)
+    else:
+        _RECORDS_CACHE.clear()
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -63,14 +103,12 @@ def _auth_headers() -> Dict[str, str]:
     # If the key looks like a Global API Key, require email and use X-Auth headers.
     if _GLOBAL_KEY_RE.match(key):
         if not email:
-            _set_last_error(
+            msg = (
                 "CLOUDFLARE_API_KEY شبیه Global API Key است، ولی CLOUDFLARE_EMAIL خالی است. "
                 "اگر از API Token استفاده می‌کنید، یک API Token بسازید و همان را در CLOUDFLARE_API_KEY قرار دهید."
             )
-            raise CloudflareAPIError(
-                "CLOUDFLARE_API_KEY شبیه Global API Key است، ولی CLOUDFLARE_EMAIL خالی است. "
-                "اگر از API Token استفاده می‌کنید، یک API Token بسازید و همان را در CLOUDFLARE_API_KEY قرار دهید."
-            )
+            _set_last_error(msg)
+            raise CloudflareAPIError(msg)
         return {
             "X-Auth-Email": email,
             "X-Auth-Key": key,
@@ -89,7 +127,7 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
     headers = _auth_headers()
 
     try:
-        resp = requests.request(method, url, headers=headers, params=params, json=json, timeout=_DEFAULT_TIMEOUT)
+        resp = _SESSION.request(method, url, headers=headers, params=params, json=json, timeout=_DEFAULT_TIMEOUT)
     except requests.RequestException as e:
         _set_last_error(f"خطا در ارتباط با Cloudflare: {e}")
         raise CloudflareAPIError(f"خطا در ارتباط با Cloudflare: {e}") from e
@@ -98,7 +136,6 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
     try:
         data = resp.json()
     except ValueError:
-        # Non-JSON response
         _set_last_error(f"پاسخ نامعتبر از Cloudflare (status={resp.status_code}).")
         raise CloudflareAPIError(
             f"پاسخ نامعتبر از Cloudflare (status={resp.status_code}).",
@@ -107,7 +144,6 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
 
     if resp.status_code >= 400 or not data.get("success", False):
         errors = data.get("errors") or []
-        # Make a concise message but keep details in logs.
         msg = errors[0].get("message") if errors and isinstance(errors[0], dict) else None
         msg = msg or f"Cloudflare API error (status={resp.status_code})."
         logger.error(
@@ -139,7 +175,6 @@ def _paginate(path: str, *, params: Optional[Dict[str, Any]] = None, per_page: i
         info = data.get("result_info") or {}
         total_pages = info.get("total_pages")
         if total_pages is None:
-            # Some endpoints might not return result_info; in that case assume single page
             break
         if page >= int(total_pages):
             break
@@ -154,18 +189,21 @@ def _paginate(path: str, *, params: Optional[Dict[str, Any]] = None, per_page: i
 
 def get_zones() -> List[Dict[str, Any]]:
     """Return all zones accessible by the configured credentials."""
+    cached = _cache_get(_ZONES_CACHE)
+    if cached is not None:
+        return list(cached)
+
     try:
-        return _paginate("/zones")
+        zones = _paginate("/zones")
+        _cache_set(_ZONES_CACHE, list(zones))
+        return zones
     except CloudflareAPIError:
-        # Let callers decide how to present; most UI paths treat empty as "no domains".
-        # Still return [] to avoid crashing callback handlers.
         return []
 
 
 def get_zone_info(domain_name: str) -> Optional[Dict[str, Any]]:
     try:
-        zones = get_zones()
-        for zone in zones:
+        for zone in get_zones():
             if zone.get("name") == domain_name:
                 return zone
         return None
@@ -175,6 +213,9 @@ def get_zone_info(domain_name: str) -> Optional[Dict[str, Any]]:
 
 def get_zone_info_by_id(zone_id: str) -> Optional[Dict[str, Any]]:
     try:
+        for zone in get_zones():
+            if zone.get("id") == zone_id:
+                return zone
         data = _request("GET", f"/zones/{zone_id}")
         return data.get("result")
     except CloudflareAPIError:
@@ -184,6 +225,8 @@ def get_zone_info_by_id(zone_id: str) -> Optional[Dict[str, Any]]:
 def delete_zone(zone_id: str) -> bool:
     try:
         _request("DELETE", f"/zones/{zone_id}")
+        _invalidate_zones_cache()
+        _invalidate_records_cache(zone_id)
         return True
     except CloudflareAPIError:
         return False
@@ -193,14 +236,24 @@ def add_domain_to_cloudflare(domain_name: str) -> bool:
     try:
         payload = {"name": domain_name, "jump_start": True}
         _request("POST", "/zones", json=payload)
+        _invalidate_zones_cache()
         return True
     except CloudflareAPIError:
         return False
 
 
 def get_dns_records(zone_id: str) -> List[Dict[str, Any]]:
+    zone_id = str(zone_id)
+    cached_bucket = _RECORDS_CACHE.get(zone_id)
+    if cached_bucket:
+        cached = _cache_get(cached_bucket)
+        if cached is not None:
+            return list(cached)
+
     try:
-        return _paginate(f"/zones/{zone_id}/dns_records")
+        records = _paginate(f"/zones/{zone_id}/dns_records")
+        _RECORDS_CACHE[zone_id] = {"ts": time.monotonic(), "data": list(records)}
+        return records
     except CloudflareAPIError:
         return []
 
@@ -216,6 +269,7 @@ def get_record_details(zone_id: str, record_id: str) -> Dict[str, Any]:
 def delete_dns_record(zone_id: str, record_id: str) -> bool:
     try:
         _request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+        _invalidate_records_cache(zone_id)
         return True
     except CloudflareAPIError:
         return False
@@ -231,6 +285,7 @@ def create_dns_record(zone_id: str, type_: str, name: str, content: str, ttl: in
             "proxied": proxied,
         }
         _request("POST", f"/zones/{zone_id}/dns_records", json=payload)
+        _invalidate_records_cache(zone_id)
         return True
     except CloudflareAPIError:
         return False
@@ -246,6 +301,7 @@ def update_dns_record(zone_id: str, record_id: str, name: str, type_: str, conte
             "proxied": proxied,
         }
         _request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", json=payload)
+        _invalidate_records_cache(zone_id)
         return True
     except CloudflareAPIError:
         return False
