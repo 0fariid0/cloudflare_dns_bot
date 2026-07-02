@@ -14,40 +14,40 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-info() { echo -e "${BLUE}ℹ️  $*${NC}"; }
-success() { echo -e "${GREEN}✅ $*${NC}"; }
-warn() { echo -e "${YELLOW}⚠️  $*${NC}"; }
-fail() { echo -e "${RED}❌ $*${NC}" >&2; pause; }
+info() { echo -e "${BLUE}[INFO] $*${NC}"; }
+success() { echo -e "${GREEN}[OK] $*${NC}"; }
+warn() { echo -e "${YELLOW}[WARN] $*${NC}"; }
+fail() { echo -e "${RED}[ERROR] $*${NC}" >&2; pause; }
 
-pause() { echo ""; read -r -p "⏎ برای بازگشت به منو Enter بزنید..." _ || true; }
+pause() { echo ""; read -r -p "Press Enter to return to the menu..." _ || true; }
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || { echo "❌ این اسکریپت باید با کاربر root اجرا شود." >&2; exit 1; }
+  [[ "${EUID}" -eq 0 ]] || { echo "[ERROR] This script must be run as root." >&2; exit 1; }
 }
 
 install_bootstrap_dependencies() {
-  command -v apt-get >/dev/null 2>&1 || { echo "❌ فقط Ubuntu/Debian پشتیبانی می‌شود." >&2; exit 1; }
+  command -v apt-get >/dev/null 2>&1 || { echo "[ERROR] Only Ubuntu/Debian systems are supported." >&2; exit 1; }
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y git curl ca-certificates python3 python3-venv python3-pip
 }
 
 show_menu() {
-  clear
-  echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-  echo "┃      ⚙️  Cloudflare DNS Bot Manager        ┃"
-  echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
-  echo "1) 🛠  نصب / نصب مجدد امن"
-  echo "2) ⚙️  ویرایش تنظیمات"
-  echo "3) 🔄 آپدیت از گیت‌هاب"
-  echo "4) ♻️  ریستارت سرویس"
-  echo "5) 📡 وضعیت سرویس"
-  echo "6) 📜 نمایش لاگ زنده"
-  echo "7) 💾 گرفتن بکاپ"
-  echo "8) ❌ حذف کامل"
-  echo "0) خروج"
+  clear || true
+  echo "+------------------------------------------+"
+  echo "|        Cloudflare DNS Bot Manager        |"
+  echo "+------------------------------------------+"
+  echo "1) Safe install / reinstall"
+  echo "2) Edit config"
+  echo "3) Update from GitHub"
+  echo "4) Restart service"
+  echo "5) Service status"
+  echo "6) Live logs"
+  echo "7) Create backup"
+  echo "8) Full uninstall"
+  echo "0) Exit"
   echo ""
-  read -r -p "انتخاب شما: " choice
+  read -r -p "Select an option: " choice
 }
 
 runtime_files=(
@@ -111,13 +111,13 @@ run_installer() {
 }
 
 install_bot() {
-  info "شروع نصب امن..."
+  info "Starting safe install..."
   install_bootstrap_dependencies
 
   local backup_dir=""
   if [[ -d "$INSTALL_DIR" ]]; then
     backup_dir="$(create_backup "$INSTALL_DIR" || true)"
-    [[ -n "$backup_dir" ]] && success "بکاپ تنظیمات قبلی: $backup_dir"
+    [[ -n "$backup_dir" ]] && success "Previous config backup: $backup_dir"
   fi
 
   safe_stop_service
@@ -125,47 +125,47 @@ install_bot() {
   git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
   restore_backup "$backup_dir"
   run_installer
-  success "نصب انجام شد."
+  success "Installation completed."
   pause
 }
 
 configure_bot() {
   local config_file="$INSTALL_DIR/config.py"
   if [[ ! -f "$config_file" ]]; then
-    fail "config.py پیدا نشد. اول ربات را نصب کنید."
+    fail "config.py was not found. Install the bot first."
     return
   fi
 
   ${EDITOR:-nano} "$config_file"
   chmod 600 "$config_file" 2>/dev/null || true
-  systemctl restart "$SERVICE_NAME" || warn "ریستارت سرویس ناموفق بود."
-  success "تنظیمات ذخیره شد و سرویس ریستارت شد."
+  systemctl restart "$SERVICE_NAME" || warn "Service restart failed."
+  success "Config saved and service restarted."
   pause
 }
 
 update_bot() {
   if [[ ! -d "$INSTALL_DIR/.git" ]]; then
-    fail "مخزن git پیدا نشد. اول نصب را انجام دهید."
+    fail "Git repository was not found. Install the bot first."
     return
   fi
 
-  info "شروع آپدیت امن..."
+  info "Starting safe update..."
   install_bootstrap_dependencies
 
   local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
-  [[ -n "$backup_dir" ]] && success "بکاپ قبل از آپدیت: $backup_dir"
+  [[ -n "$backup_dir" ]] && success "Backup before update: $backup_dir"
 
   cd "$INSTALL_DIR" || return 1
   git fetch origin "$BRANCH"
   git reset --hard "origin/${BRANCH}"
   restore_backup "$backup_dir"
   run_installer
-  success "آپدیت کامل شد."
+  success "Update completed."
   pause
 }
 
 restart_service() {
-  systemctl restart "$SERVICE_NAME" && success "سرویس ریستارت شد." || warn "ریستارت سرویس ناموفق بود."
+  systemctl restart "$SERVICE_NAME" && success "Service restarted." || warn "Service restart failed."
   pause
 }
 
@@ -175,34 +175,34 @@ service_status() {
 }
 
 live_logs() {
-  echo "برای خروج Ctrl+C بزنید."
+  echo "Press Ctrl+C to exit."
   journalctl -u "$SERVICE_NAME" -f --no-pager
 }
 
 manual_backup() {
   local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
   if [[ -n "$backup_dir" ]]; then
-    success "بکاپ ساخته شد: $backup_dir"
+    success "Backup created: $backup_dir"
   else
-    warn "فایل قابل بکاپی پیدا نشد."
+    warn "No runtime files were found to back up."
   fi
   pause
 }
 
 uninstall_bot() {
-  warn "این کار سرویس و پوشه نصب را حذف می‌کند. فایل‌های مهم قبل از حذف بکاپ می‌شوند."
-  read -r -p "برای تایید عبارت DELETE را بنویسید: " confirm
-  [[ "$confirm" == "DELETE" ]] || { warn "لغو شد."; pause; return; }
+  warn "This will remove the service and install directory. Important runtime files will be backed up first."
+  read -r -p "Type DELETE to confirm: " confirm
+  [[ "$confirm" == "DELETE" ]] || { warn "Cancelled."; pause; return; }
 
   local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
-  [[ -n "$backup_dir" ]] && success "بکاپ قبل از حذف: $backup_dir"
+  [[ -n "$backup_dir" ]] && success "Backup before uninstall: $backup_dir"
 
   safe_stop_service
   systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
   systemctl daemon-reload
   rm -rf "$INSTALL_DIR"
-  success "ربات حذف شد."
+  success "Bot uninstalled."
   pause
 }
 
@@ -219,8 +219,8 @@ main() {
       6) live_logs ;;
       7) manual_backup ;;
       8) uninstall_bot ;;
-      0) echo "خروج"; exit 0 ;;
-      *) warn "گزینه نامعتبر است."; sleep 1 ;;
+      0) echo "Exit"; exit 0 ;;
+      *) warn "Invalid option."; sleep 1 ;;
     esac
   done
 }

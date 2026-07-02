@@ -20,17 +20,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-info() { echo -e "${BLUE}ℹ️  $*${NC}"; }
-success() { echo -e "${GREEN}✅ $*${NC}"; }
-warn() { echo -e "${YELLOW}⚠️  $*${NC}"; }
-fail() { echo -e "${RED}❌ $*${NC}" >&2; exit 1; }
+info() { echo -e "${BLUE}[INFO] $*${NC}"; }
+success() { echo -e "${GREEN}[OK] $*${NC}"; }
+warn() { echo -e "${YELLOW}[WARN] $*${NC}"; }
+fail() { echo -e "${RED}[ERROR] $*${NC}" >&2; exit 1; }
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || fail "این اسکریپت باید با کاربر root اجرا شود."
+  [[ "${EUID}" -eq 0 ]] || fail "This script must be run as root."
 }
 
 require_debian_like() {
-  command -v apt-get >/dev/null 2>&1 || fail "این نصب‌کننده فقط برای Ubuntu/Debian آماده شده است."
+  command -v apt-get >/dev/null 2>&1 || fail "This installer only supports Ubuntu/Debian systems."
 }
 
 backup_file() {
@@ -39,7 +39,7 @@ backup_file() {
   local backup="${file}.bak.$(date +%Y%m%d-%H%M%S)"
   cp -a "$file" "$backup"
   chmod 600 "$backup" 2>/dev/null || true
-  warn "از فایل قبلی بکاپ گرفته شد: $backup"
+  warn "Existing file backed up: $backup"
 }
 
 read_secret() {
@@ -49,7 +49,7 @@ read_secret() {
   while [[ -z "$value" ]]; do
     read -r -s -p "$prompt" value
     echo ""
-    [[ -n "$value" ]] || warn "این مقدار نمی‌تواند خالی باشد."
+    [[ -n "$value" ]] || warn "This value cannot be empty."
   done
   printf -v "$var_name" '%s' "$value"
 }
@@ -66,7 +66,7 @@ read_admin_id() {
   local value="${ADMIN_ID:-}"
   while [[ ! "$value" =~ ^[0-9]+$ ]]; do
     read -r -p "Enter Admin Telegram numeric ID: " value
-    [[ "$value" =~ ^[0-9]+$ ]] || warn "ADMIN_ID باید فقط عدد باشد."
+    [[ "$value" =~ ^[0-9]+$ ]] || warn "ADMIN_ID must contain only numbers."
   done
   ADMIN_ID_INPUT="$value"
 }
@@ -74,7 +74,7 @@ read_admin_id() {
 create_config() {
   if [[ "$REUSE_CONFIG" == true && -s config.py ]]; then
     chmod 600 config.py 2>/dev/null || true
-    success "از config.py موجود استفاده شد."
+    success "Existing config.py was reused."
     return 0
   fi
 
@@ -83,7 +83,7 @@ create_config() {
   local cf_email="${CLOUDFLARE_EMAIL:-}"
 
   echo ""
-  info "Cloudflare API Token پیشنهاد می‌شود. اگر Global API Key می‌دهید، ایمیل Cloudflare هم لازم است."
+  info "Cloudflare API Token is recommended. If you use a Global API Key, Cloudflare email is also required."
   echo ""
 
   [[ -n "$bot_token" ]] || read_secret "Enter Bot Token: " bot_token
@@ -118,27 +118,27 @@ ADMIN_ID = {int(os.environ["ADMIN_ID_INPUT"])}
 Path("config.py").write_text(config, encoding="utf-8")
 PY
   chmod 600 config.py
-  success "config.py با فرمت امن ساخته شد."
+  success "config.py was created safely."
 }
 
 install_system_dependencies() {
   export DEBIAN_FRONTEND=noninteractive
-  info "نصب/بررسی پکیج‌های سیستمی..."
+  info "Installing/checking system packages..."
   apt-get update -y
   apt-get install -y python3 python3-venv python3-pip git curl ca-certificates
 }
 
 install_python_dependencies() {
-  [[ -f requirements.txt ]] || fail "requirements.txt پیدا نشد."
-  info "آماده‌سازی محیط مجازی Python..."
+  [[ -f requirements.txt ]] || fail "requirements.txt was not found."
+  info "Preparing Python virtual environment..."
   python3 -m venv venv
   ./venv/bin/python -m pip install --upgrade pip setuptools wheel
   ./venv/bin/python -m pip install --no-cache-dir -r requirements.txt
-  success "وابستگی‌های Python نصب/آپدیت شد."
+  success "Python dependencies installed/updated."
 }
 
 write_service() {
-  info "ساخت سرویس systemd..."
+  info "Creating systemd service..."
   cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
 Description=${APP_NAME}
@@ -166,20 +166,20 @@ EOF_SERVICE
 }
 
 start_service() {
-  info "راه‌اندازی سرویس..."
+  info "Starting service..."
   systemctl restart "$SERVICE_NAME"
   sleep 1
   if systemctl is-active --quiet "$SERVICE_NAME"; then
-    success "سرویس فعال است."
+    success "Service is active."
   else
-    warn "سرویس استارت شد ولی فعال دیده نشد. لاگ را بررسی کنید: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
+    warn "Service was started but is not active. Check logs: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
   fi
 }
 
 main() {
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "🚀 ${APP_NAME} Installer"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "--------------------------------------"
+  echo "${APP_NAME} Installer"
+  echo "--------------------------------------"
 
   require_root
   require_debian_like
@@ -190,9 +190,9 @@ main() {
   start_service
 
   echo ""
-  success "نصب/آپدیت کامل شد."
-  echo "📡 وضعیت:  systemctl status ${SERVICE_NAME}"
-  echo "📜 لاگ:    journalctl -u ${SERVICE_NAME} -f"
+  success "Install/update completed."
+  echo "Status:  systemctl status ${SERVICE_NAME}"
+  echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
 }
 
 main "$@"
