@@ -6,6 +6,7 @@ import asyncio
 import copy
 import os
 import tempfile
+import sys
 import httpx
 from collections import defaultdict
 from enum import Enum, auto
@@ -45,6 +46,8 @@ except Exception as e:
     raise RuntimeError(
         "ایمپورت cloudflare_api ناموفق بود. لطفاً مطمئن شوید پکیج‌ها نصب هستند: pip install -r requirements.txt (خصوصاً requests)."
     ) from e
+
+import dns_advanced as dns_adv
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -698,6 +701,7 @@ def reset_user_state(uid, keep_zone=False):
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reset_user_state(user_id)
+    dns_adv.FEATURE_INPUT.pop(user_id, None)
     try:
         zones = get_user_accessible_zones(user_id)
     except Exception as e:
@@ -728,6 +732,19 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for zone in zones:
             status_icon = "✅" if zone["status"] == "active" else "⏳"
             keyboard.append([InlineKeyboardButton(f"{zone['name']} {status_icon}", callback_data=f"zone_{zone['id']}")])
+    # Independent group entries appear next to domains on the home screen.
+    if zones:
+        with dns_adv.db() as connection:
+            groups = connection.execute("SELECT id,name FROM dns_groups WHERE owner=? ORDER BY name LIMIT 20", (user_id,)).fetchall()
+        group_buttons = [[InlineKeyboardButton(f"📁 {item['name'][:42]}", callback_data=f"dx_g_{item['id']}")] for item in groups]
+        keyboard = group_buttons + keyboard
+    keyboard.extend([
+        [InlineKeyboardButton("📁 گروه‌های DNS", callback_data="dx_groups"),
+         InlineKeyboardButton("🔁 تغییر گروهی IP", callback_data="dx_bulk")],
+        [InlineKeyboardButton("🔎 جست‌وجو", callback_data="dx_search"),
+         InlineKeyboardButton("📡 مانیتورینگ", callback_data="dx_monitor")],
+        [InlineKeyboardButton("📜 تاریخچه DNS", callback_data="dx_history")]
+    ])
     action_buttons = [InlineKeyboardButton("🔄 رفرش", callback_data="refresh_domains")]
     if user_id == ADMIN_ID:
         action_buttons.append(InlineKeyboardButton("🗑️ حذف دامنه", callback_data="delete_domain_menu"))
@@ -1201,6 +1218,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     update_known_user_profile(update.effective_user)
 
+    if await dns_adv.handle_message(update, context, sys.modules[__name__]):
+        return
+
     state = user_state.get(uid, {})
     mode = state.get("mode")
     text = update.message.text.strip()
@@ -1295,6 +1315,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             record = get_record_details(zone_id, record_id)
             if record:
                 if update_dns_record(zone_id, record_id, record["name"], record["type"], new_content, record["ttl"], record.get("proxied", False)):
+                    dns_adv.write_history(uid, "single", zone_id, record_id, record, {**record, "content": new_content})
                     log_action(uid, f"UPDATE Content for '{record['name']}' to '{new_content}'")
                     await update.message.reply_text("✅ محتوای رکورد با موفقیت به‌روز شد.")
                     new_msg = await update.message.reply_text("...در حال بارگذاری تنظیمات جدید")
@@ -1362,6 +1383,8 @@ async def run_smart_check_logic(context: ContextTypes.DEFAULT_TYPE, zone_id: str
             next_ip = ip_lists["reserve"].pop(0)
             
             if update_dns_record(zone_id, record_id, record_details["name"], record_details["type"], next_ip, record_details["ttl"], record_details.get("proxied", False)):
+                dns_adv.write_history(user_id or "Auto", "smart", zone_id, record_id, record_details, {**record_details, "content": next_ip})
+                record_details["content"] = next_ip
                 notification_text += f"- آی‌پی جدید `{next_ip}` از لیست رزرو جایگزین شد. در حال تست...\n"
                 
                 is_next_pinging, new_ip_report = await check_ip_ping(next_ip, check_location)
@@ -1405,7 +1428,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(uid):
         await show_request_access_menu(update, context); return
     update_known_user_profile(query.from_user)
-        
+
+    # Do not leave a pending old record edit active when entering group workflows
+    # (or vice versa). Old menus keep their original behavior.
+    if data.startswith("dx_"):
+        reset_user_state(uid)
+    else:
+        dns_adv.FEATURE_INPUT.pop(uid, None)
+    if await dns_adv.handle_callback(update, context, sys.modules[__name__]):
+        return
+
     if data.startswith((
         'manage_', 'user_card_', 'delete_user_', 'block_user_', 'unblock_user_', 'access_',
         'add_user_prompt', 'toggle_access_', 'set_all_access_', 'clear_access_',
@@ -1684,6 +1716,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("toggle_proxy_"):
         record_id = data.split("_")[-1]; record_details = get_record_details(zone_id, record_id)
         if toggle_proxied_status(zone_id, record_id):
+            if record_details:
+                dns_adv.write_history(uid, "single", zone_id, record_id, record_details, {**record_details, "proxied": not record_details.get("proxied", False)})
             log_action(uid, f"Toggled proxy for '{record_details.get('name', record_id)}'"); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.", show_alert=True)
     elif data.startswith("editip_"):
@@ -1703,6 +1737,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts, record_id, ttl = data.split("_"), data.split("_")[2], int(data.split("_")[3])
         record = get_record_details(zone_id, record_id)
         if record and update_dns_record(zone_id, record_id, record["name"], record["type"], record["content"], ttl, record.get("proxied", False)):
+            dns_adv.write_history(uid, "single", zone_id, record_id, record, {**record, "ttl": ttl})
             log_action(uid, f"Updated TTL for '{record['name']}' to {ttl}"); await query.answer("✅ TTL تغییر یافت."); await show_record_settings(query.message, uid, zone_id, record_id)
         else: await query.answer("❌ عملیات ناموفق بود.")
     elif data == "add_record":
@@ -1747,13 +1782,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         record_details = get_record_details(zone_id, record_id)
         await query.message.edit_text("⏳ در حال حذف رکورد...")
         if delete_dns_record(zone_id, record_id):
+            if record_details:
+                dns_adv.write_history(uid, "delete", zone_id, record_id, record_details, {})
             if record_details: log_action(uid, f"DELETE record '{record_details.get('name', 'N/A')}'")
             else: log_action(uid, f"DELETE record with ID '{record_id}' (details not found).")
             await query.message.edit_text("✅ رکورد حذف شد.")
         else: await query.message.edit_text("❌ حذف رکورد ناموفق بود.")
         await show_records_list(update, context)
 
+async def dns_monitor_tick(context):
+    await dns_adv.monitor_job(context, sys.modules[__name__])
+
+
 def main():
+    dns_adv.initialize()
     load_users(); load_blocked_users(); load_requests(); load_ip_lists(); load_smart_settings()
     logger.info("Starting bot...")
     
@@ -1762,6 +1804,10 @@ def main():
     app_builder.job_queue(job_queue)
     app = app_builder.build()
     
+    # Monitors only observe and notify: they never mutate Cloudflare DNS records.
+    job_queue.run_repeating(dns_monitor_tick, interval=dns_adv.MONITOR_INTERVAL,
+                            first=30, name="dns_advanced_monitor")
+
     # Schedule jobs for all auto-check records at startup
     settings = load_smart_settings()
     auto_check_list = settings.get("auto_check_records", [])

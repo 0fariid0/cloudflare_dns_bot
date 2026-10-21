@@ -58,6 +58,7 @@ runtime_files=(
   "smart_connect_ips.json"
   "smart_connect_settings.json"
   "bot_audit.log"
+  "dns_advanced.sqlite3"
 )
 
 create_backup() {
@@ -70,7 +71,25 @@ create_backup() {
   local copied=0
   for file in "${runtime_files[@]}"; do
     if [[ -f "$source_dir/$file" ]]; then
-      cp -a "$source_dir/$file" "$backup_dir/"
+      if [[ "$file" == "dns_advanced.sqlite3" ]]; then
+        # Safe SQLite snapshot even while the bot is running and WAL is active.
+        if ! python3 - "$source_dir/$file" "$backup_dir/$file" <<'PY_SQLITE'
+import sqlite3, sys
+source = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+target = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(target)
+finally:
+    target.close()
+    source.close()
+PY_SQLITE
+        then
+          echo "[ERROR] SQLite backup failed: $source_dir/$file" >&2
+          return 1
+        fi
+      else
+        cp -a "$source_dir/$file" "$backup_dir/"
+      fi
       copied=$((copied + 1))
     fi
   done
@@ -117,6 +136,10 @@ install_bot() {
   local backup_dir=""
   if [[ -d "$INSTALL_DIR" ]]; then
     backup_dir="$(create_backup "$INSTALL_DIR" || true)"
+    if [[ -f "$INSTALL_DIR/dns_advanced.sqlite3" && ( -z "$backup_dir" || ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
+      echo "[ERROR] DNS group/history database backup failed. Installation aborted." >&2
+      return 1
+    fi
     [[ -n "$backup_dir" ]] && success "Previous config backup: $backup_dir"
   fi
 
@@ -153,15 +176,33 @@ update_bot() {
   install_bootstrap_dependencies
 
   local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
+  if [[ -f "$INSTALL_DIR/dns_advanced.sqlite3" && ( -z "$backup_dir" || ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
+    echo "[ERROR] DNS database backup failed. Update aborted." >&2
+    return 1
+  fi
   [[ -n "$backup_dir" ]] && success "Backup before update: $backup_dir"
 
   cd "$INSTALL_DIR" || return 1
-  git fetch origin "$BRANCH"
-  git reset --hard "origin/${BRANCH}"
-  restore_backup "$backup_dir"
-  run_installer
-  success "Update completed."
-  pause
+  local old_commit
+  old_commit="$(git rev-parse HEAD)" || return 1
+  # Fetch *before* stopping the running bot. A network error must not cause downtime.
+  if ! git fetch origin "$BRANCH"; then
+    warn "Fetch failed. Existing bot was not changed."
+    return 1
+  fi
+
+  safe_stop_service
+  if git reset --hard "origin/${BRANCH}" && restore_backup "$backup_dir" && run_installer; then
+    success "Update completed."
+    pause
+    return 0
+  fi
+
+  echo "[ERROR] Update failed; attempting to restore the prior source and runtime data." >&2
+  git reset --hard "$old_commit" || warn "Could not restore prior commit automatically."
+  restore_backup "$backup_dir" || warn "Could not restore runtime backup automatically."
+  run_installer || warn "Could not restart the previous bot; examine systemctl and journalctl."
+  return 1
 }
 
 restart_service() {
@@ -195,6 +236,10 @@ uninstall_bot() {
   [[ "$confirm" == "DELETE" ]] || { warn "Cancelled."; pause; return; }
 
   local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
+  if [[ -f "$INSTALL_DIR/dns_advanced.sqlite3" && ( -z "$backup_dir" || ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
+    echo "[ERROR] DNS database backup failed. Uninstall aborted." >&2
+    return 1
+  fi
   [[ -n "$backup_dir" ]] && success "Backup before uninstall: $backup_dir"
 
   safe_stop_service

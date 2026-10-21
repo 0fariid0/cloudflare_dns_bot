@@ -292,15 +292,28 @@ def create_dns_record(zone_id: str, type_: str, name: str, content: str, ttl: in
 
 
 def update_dns_record(zone_id: str, record_id: str, name: str, type_: str, content: str, ttl: int = 120, proxied: bool = False) -> bool:
+    """Keep original signature but preserve Cloudflare comments/tags/settings.
+
+    Existing callers pass the unchanged name/type. Use PATCH for changed fields
+    rather than full PUT, which would unintentionally replace record metadata.
+    """
     try:
-        payload = {
-            "type": type_,
-            "name": name,
-            "content": content,
-            "ttl": ttl,
-            "proxied": proxied,
-        }
-        _request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", json=payload)
+        old = get_record_details_strict(zone_id, record_id)
+        if old.get("name") != name or old.get("type") != type_:
+            # Legacy compatibility for name/type edits (not used by current UI).
+            payload = {"type": type_, "name": name, "content": content,
+                       "ttl": ttl, "proxied": proxied}
+            for extra in ("comment", "tags", "settings"):
+                if extra in old:
+                    payload[extra] = old[extra]
+            _request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", json=payload)
+        else:
+            changes = {}
+            for field, value in (("content", content), ("ttl", int(ttl)), ("proxied", bool(proxied))):
+                if old.get(field) != value:
+                    changes[field] = value
+            if changes:
+                _request("PATCH", f"/zones/{zone_id}/dns_records/{record_id}", json=changes)
         _invalidate_records_cache(zone_id)
         return True
     except CloudflareAPIError:
@@ -321,3 +334,31 @@ def toggle_proxied_status(zone_id: str, record_id: str) -> bool:
         int(record.get("ttl", 120)),
         new_status,
     )
+
+
+def patch_dns_fields(zone_id: str, record_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Change only requested DNS fields, preserving Cloudflare record metadata.
+
+    Unlike the legacy full PUT helper this is safe for comments, tags and other
+    record properties not surfaced by the old Telegram UI. Raises on failures.
+    """
+    allowed = {"content", "ttl", "proxied", "comment"}
+    if not fields or any(key not in allowed for key in fields):
+        raise ValueError("Unsupported DNS field")
+    data = _request("PATCH", f"/zones/{zone_id}/dns_records/{record_id}", json=fields)
+    _invalidate_records_cache(str(zone_id))
+    return data.get("result") or {}
+
+
+def get_dns_records_fresh(zone_id: str) -> List[Dict[str, Any]]:
+    """Fresh, complete listing. Errors propagate (never confuse outage with empty list)."""
+    return _paginate(f"/zones/{zone_id}/dns_records")
+
+
+def get_record_details_strict(zone_id: str, record_id: str) -> Dict[str, Any]:
+    """Fresh record or raised API error; no cached/ambiguous empty result."""
+    data = _request("GET", f"/zones/{zone_id}/dns_records/{record_id}")
+    result = data.get("result")
+    if not isinstance(result, dict) or not result:
+        raise CloudflareAPIError("رکورد انتخابی پیدا نشد.")
+    return result
