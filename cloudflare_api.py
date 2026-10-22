@@ -42,7 +42,7 @@ _RETRY = Retry(
     status=2,
     backoff_factor=0.35,
     status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+    allowed_methods=frozenset(["GET", "PUT", "PATCH", "DELETE"]),
     raise_on_status=False,
 )
 _ADAPTER = HTTPAdapter(max_retries=_RETRY, pool_connections=10, pool_maxsize=20)
@@ -194,7 +194,7 @@ def get_zones() -> List[Dict[str, Any]]:
         return list(cached)
 
     try:
-        zones = _paginate("/zones")
+        zones = _paginate("/zones", per_page=50)
         _cache_set(_ZONES_CACHE, list(zones))
         return zones
     except CloudflareAPIError:
@@ -281,7 +281,7 @@ def create_dns_record(zone_id: str, type_: str, name: str, content: str, ttl: in
             "type": type_,
             "name": name,
             "content": content,
-            "ttl": ttl,
+            "ttl": 1 if proxied else ttl,
             "proxied": proxied,
         }
         _request("POST", f"/zones/{zone_id}/dns_records", json=payload)
@@ -324,6 +324,8 @@ def toggle_proxied_status(zone_id: str, record_id: str) -> bool:
     record = get_record_details(zone_id, record_id)
     if not record:
         return False
+    if not record.get("proxiable", record.get("type") in ("A", "AAAA", "CNAME")):
+        return False
     new_status = not record.get("proxied", False)
     return update_dns_record(
         zone_id,
@@ -331,7 +333,7 @@ def toggle_proxied_status(zone_id: str, record_id: str) -> bool:
         record.get("name", ""),
         record.get("type", ""),
         record.get("content", ""),
-        int(record.get("ttl", 120)),
+        1 if new_status else int(record.get("ttl", 120)),
         new_status,
     )
 

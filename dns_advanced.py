@@ -13,7 +13,7 @@ import secrets
 import socket
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any
@@ -21,6 +21,7 @@ from typing import Any
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
 
 import cloudflare_api as cf
+from bot_ui import render, compact_rows
 
 try:
     import dns.resolver
@@ -142,11 +143,10 @@ def txt(s, n=48):
 
 
 async def show(update, text, keyboard, *, edit=True):
-    markup = Markup(keyboard)
-    if edit and update.callback_query:
-        await update.effective_message.edit_text(text[:3900], reply_markup=markup)
+    if edit:
+        await render(update, text[:3900], keyboard)
     else:
-        await update.effective_message.reply_text(text[:3900], reply_markup=markup)
+        await update.effective_message.reply_text(text[:3900], reply_markup=Markup(keyboard))
 
 
 def name_of(zone_id, record):
@@ -171,7 +171,7 @@ async def groups_menu(update, core, uid, page=0):
     with db() as c:
         rows = c.execute("SELECT * FROM dns_groups WHERE owner=? ORDER BY name", (uid,)).fetchall()
     items,p = page_slice(rows,page)
-    keyboard = [[Button(f"📁 {txt(row['name'], 42)}", callback_data=f"dx_g_{row['id']}")] for row in items]
+    keyboard = compact_rows([row[0] for row in [[Button(f"📁 {txt(row['name'], 42)}", callback_data=f"dx_g_{row['id']}")] for row in items]])
     keyboard += pager(p,len(rows),"dx_groups_")
     keyboard += [[Button("➕ ساخت گروه جدید", callback_data="dx_gnew")], back("back_to_main")]
     await show(update, f"📁 گروه‌های DNS ({len(rows)})\nبا انتخاب گروه، رکوردهای عضو و تنظیمات گروهی را مدیریت کنید.", keyboard)
@@ -198,10 +198,8 @@ async def group_menu(update, core, uid, gid, page=0):
             lines.append("⚠️ رکورد حذف شده یا دریافت ناموفق")
             keyboard.append([Button("➖ حذف عضو نامعتبر", callback_data=f"dx_rm_{gid}_{m['record_id']}")])
     keyboard += pager(p,len(mm),f"dx_gp_{gid}_")
-    keyboard += [[Button("➕ افزودن ساب‌دامنه", callback_data=f"dx_addz_{gid}_0")],
-                 [Button("✏️ ویرایش همه اعضا", callback_data=f"dx_ge_{gid}")],
-                 [Button("🖊 تغییر نام گروه", callback_data=f"dx_grename_{gid}")],
-                 [Button("🗑️ حذف خود گروه", callback_data=f"dx_gdelq_{gid}")], back("dx_groups")]
+    keyboard += [[Button("➕ عضو جدید", callback_data=f"dx_addz_{gid}_0"), Button("✏️ ویرایش اعضا", callback_data=f"dx_ge_{gid}")],
+                 [Button("🖊 نام گروه", callback_data=f"dx_grename_{gid}"), Button("🗑 حذف گروه", callback_data=f"dx_gdelq_{gid}")], back("dx_groups")]
     await show(update, "\n".join(lines), keyboard)
 
 
@@ -209,7 +207,7 @@ async def add_zone_menu(update, core, uid, gid, page):
     if not group(uid, gid): return
     zones = list(zones_for(core, uid).values())
     items,p = page_slice(zones, page)
-    keyboard = [[Button(txt(z["name"], 42), callback_data=f"dx_addr_{gid}_{z['id']}_0")] for z in items]
+    keyboard = compact_rows([row[0] for row in [[Button(txt(z["name"], 42), callback_data=f"dx_addr_{gid}_{z['id']}_0")] for z in items]])
     keyboard += pager(p,len(zones),f"dx_addz_{gid}_") + [back(f"dx_g_{gid}")]
     await show(update, "🌐 دامنه‌ای را برای انتخاب رکورد مشخص کنید:", keyboard)
 
@@ -234,10 +232,8 @@ async def add_record_menu(update, core, uid, gid, zone_id, page):
 async def group_edit_menu(update, core, uid, gid):
     if not group(uid,gid): return
     await show(update,"✏️ ویرایش گروهی: فقط تنظیم انتخاب‌شده در تمام اعضا تغییر می‌کند.\nقبل از اجرا پیش‌نمایش و تأیید گرفته می‌شود.",
-               [[Button("🌐 IP / Content",callback_data=f"dx_field_{gid}_content")],
-                [Button("⏱ TTL",callback_data=f"dx_field_{gid}_ttl")],
-                [Button("☁️ وضعیت Proxy",callback_data=f"dx_field_{gid}_proxied")],
-                [Button("📝 توضیحات Cloudflare",callback_data=f"dx_field_{gid}_comment")],back(f"dx_g_{gid}")])
+               [[Button("🌐 IP / Content",callback_data=f"dx_field_{gid}_content"), Button("⏱ TTL",callback_data=f"dx_field_{gid}_ttl")],
+                [Button("☁️ Proxy",callback_data=f"dx_field_{gid}_proxied"), Button("📝 توضیحات",callback_data=f"dx_field_{gid}_comment")],back(f"dx_g_{gid}")])
 
 
 def valid_value(field, value, records):
@@ -347,7 +343,7 @@ async def bulk_menu(update, core, uid, page=0):
     selected=BULK_SELECTION.setdefault(uid,set())
     zones=list(zones_for(core,uid).values())
     items,p=page_slice(zones,page)
-    kb=[[Button(txt(z['name'],43),callback_data=f"dx_bz_{z['id']}_0")] for z in items]
+    kb= compact_rows([row[0] for row in [[Button(txt(z['name'],43),callback_data=f"dx_bz_{z['id']}_0")] for z in items]])
     kb+=pager(p,len(zones),"dx_bulk_")
     kb += [[Button(f"✅ انتخاب‌شده: {len(selected)} | تغییر IP",callback_data="dx_bedit")],
            [Button("🧹 پاک‌کردن انتخاب‌ها",callback_data="dx_bclear")],back("back_to_main")]
@@ -406,7 +402,7 @@ async def search_records(update, core, uid, field, term):
 async def search_results(update,uid,page,notice=""):
     results=SEARCH_CACHE.get(uid,[])
     part,p=page_slice(list(enumerate(results)),page)
-    kb=[[Button(f"{txt(r['name'],28)} {r['type']} | {txt(r['content'],12)}",callback_data=f"dx_sd_{i}")] for i,r in part]
+    kb= compact_rows([row[0] for row in [[Button(f"{txt(r['name'],28)} {r['type']} | {txt(r['content'],12)}",callback_data=f"dx_sd_{i}")] for i,r in part]])
     kb+=pager(p,len(results),"dx_sp_")+ [back("dx_search")]
     await show(update,f"🔎 نتایج جست‌وجو ({len(results)})\n{notice}",kb)
 
@@ -420,11 +416,11 @@ async def history_menu(update,core,uid,page):
         with db() as c:
             rows=c.execute(f"SELECT * FROM dns_change_history WHERE zone_id IN ({placeholders}) ORDER BY id DESC LIMIT 400", tuple(zones)).fetchall()
     part,p=page_slice(rows,page)
-    lines=[f"📜 تاریخچه تغییرات DNS ({len(rows)} مورد اخیر قابل مشاهده)","زمان‌ها: UTC",""]
+    lines=[f"📜 تاریخچه تغییرات DNS ({len(rows)} مورد اخیر قابل مشاهده)","زمان‌ها: تهران",""]
     for row in part:
         before=json.loads(row['before_json']);after=json.loads(row['after_json'])
         diffs=[f"{key}: {txt(before.get(key),18)}→{txt(after.get(key),18)}" for key in ('content','ttl','proxied','comment') if before.get(key)!=after.get(key)]
-        lines += [f"• {row['created_at'][:16]} | {txt(row['record_name'],35)}",
+        lines += [f"• {datetime.fromisoformat(row['created_at']).astimezone(timezone(timedelta(hours=3, minutes=30))).strftime('%Y/%m/%d %H:%M')} | {txt(row['record_name'],35)}",
                   f"  کاربر: {row['actor']} | {row['source']}",
                   "  "+(", ".join(diffs) if diffs else "بدون تغییر قابل مشاهده")]
     if not part: lines.append("تغییری ثبت نشده است.")
@@ -456,7 +452,7 @@ async def monitors_menu(update,core,uid,page=0):
 
 async def monitor_zones(update,core,uid,page):
     zones=list(zones_for(core,uid).values());part,p=page_slice(zones,page)
-    kb=[[Button(txt(z['name']),callback_data=f"dx_mr_{z['id']}_0")] for z in part]
+    kb= compact_rows([row[0] for row in [[Button(txt(z['name']),callback_data=f"dx_mr_{z['id']}_0")] for z in part]])
     kb+=pager(p,len(zones),"dx_mz_")+[back("dx_monitor")]
     await show(update,"دامنه مانیتور را انتخاب کنید:",kb)
 
@@ -468,7 +464,7 @@ async def monitor_records(update,core,uid,zid,page):
         await show(update,f"خطا: {txt(e,150)}",[back("dx_monitor")]);return
     part,p=page_slice(records,page)
     FEATURE_INPUT[uid]={"monitor_zone":zid}
-    kb=[[Button(f"{txt(r['name'],30)} → {txt(r['content'],20)}",callback_data=f"dx_madd_{r['id']}")] for r in part]
+    kb= compact_rows([row[0] for row in [[Button(f"{txt(r['name'],30)} → {txt(r['content'],20)}",callback_data=f"dx_madd_{r['id']}")] for r in part]])
     kb+=pager(p,len(records),f"dx_mr_{zid}_")+[back("dx_monitor")]
     await show(update,"رکورد A / AAAA برای مانیتورینگ انتخاب کنید:",kb)
 
@@ -563,6 +559,7 @@ async def handle_message(update,context,core):
     FEATURE_INPUT.pop(uid,None)
     if mode in ('group_new','group_rename'):
         if not text or len(text)>48 or any(ord(c)<32 for c in text):
+            FEATURE_INPUT[uid]=state
             await update.message.reply_text("نام گروه باید ۱ تا ۴۸ کاراکتر بدون نویسه کنترلی باشد.");return True
         try:
             if mode=='group_new':
@@ -587,6 +584,7 @@ async def handle_message(update,context,core):
         field=state['field']
         if field=='proxied':
             if text.casefold() not in ('true','false','on','off','1','0','فعال','غیرفعال'):
+                FEATURE_INPUT[uid]=state
                 await update.message.reply_text("برای پروکسی: on یا off بنویسید.");return True
             text='True' if text.casefold() in ('true','on','1','فعال') else 'False'
         await search_records(update,core,uid,field,text);return True
