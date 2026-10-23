@@ -713,6 +713,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_state(uid)
     dns_adv.FEATURE_INPUT.pop(uid, None)
     dns_adv.PENDING.pop(uid, None)
+    dns_adv.group_clones.PLANS.pop(uid, None)
     zones = (await asyncio.to_thread(get_user_accessible_zones, uid))
     error = get_last_error()
     with dns_adv.db() as c:

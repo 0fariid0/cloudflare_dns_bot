@@ -6,6 +6,8 @@ monitor state and audit history. No Cloudflare credentials are persisted.
 from __future__ import annotations
 
 import asyncio
+import sys
+import dns_group_clones as group_clones
 import ipaddress
 import json
 import logging
@@ -87,6 +89,8 @@ def initialize():
                 PRIMARY KEY(owner,zone_id,record_id)
             );
         """)
+
+    group_clones.initialize(sys.modules[__name__])
 
 
 def stamp():
@@ -198,6 +202,7 @@ async def group_menu(update, core, uid, gid, page=0):
             lines.append("⚠️ رکورد حذف شده یا دریافت ناموفق")
             keyboard.append([Button("➖ حذف عضو نامعتبر", callback_data=f"dx_rm_{gid}_{m['record_id']}")])
     keyboard += pager(p,len(mm),f"dx_gp_{gid}_")
+    keyboard += [[Button("🧬 کلون‌های گروه", callback_data=f"dx_cm_{gid}")]]
     keyboard += [[Button("➕ عضو جدید", callback_data=f"dx_addz_{gid}_0"), Button("✏️ ویرایش اعضا", callback_data=f"dx_ge_{gid}")],
                  [Button("🖊 نام گروه", callback_data=f"dx_grename_{gid}"), Button("🗑 حذف گروه", callback_data=f"dx_gdelq_{gid}")], back("dx_groups")]
     await show(update, "\n".join(lines), keyboard)
@@ -557,6 +562,13 @@ async def handle_message(update,context,core):
     text=update.message.text.strip()
     mode=state['mode']
     FEATURE_INPUT.pop(uid,None)
+    if mode == 'clone_ips':
+        try:
+            await group_clones.preview_create(update,core,sys.modules[__name__],uid,state['gid'],text)
+        except Exception as exc:
+            FEATURE_INPUT[uid]=state
+            await show(update,'❌ '+txt(exc,300),[back(f"dx_cm_{state['gid']}")])
+        return True
     if mode in ('group_new','group_rename'):
         if not text or len(text)>48 or any(ord(c)<32 for c in text):
             FEATURE_INPUT[uid]=state
@@ -630,6 +642,9 @@ async def handle_callback(update,context,core):
     # Forget only text-input state on navigation (maintain zone_pick/bulk selection flow).
     if not data.startswith(('dx_join_','dx_bs_','dx_madd_')):
         FEATURE_INPUT.pop(uid,None)
+    if await group_clones.callback(update,context,core,sys.modules[__name__]):
+        return True
+    group_clones.PLANS.pop(uid,None)
     try:
         if data=='dx_groups' or data.startswith('dx_groups_'):
             await groups_menu(update,core,uid,int(data[len('dx_groups_'):]) if data!='dx_groups' else 0)
@@ -676,6 +691,8 @@ async def handle_callback(update,context,core):
                        [[Button("🗑️ تأیید حذف گروه",callback_data=f"dx_gdel_{gid}")],back(f"dx_g_{gid}")])
         elif data.startswith('dx_gdel_'):
             gid=data.split('_')[-1]
+            if group_clones.rows(sys.modules[__name__],uid,gid) or (uid,gid) in group_clones.BUSY:
+                raise ValueError('ابتدا کلون‌های گروه را از بخش کلون‌ها حذف کنید؛ سپس خود گروه را حذف کنید.')
             with db() as c:c.execute("DELETE FROM dns_groups WHERE owner=? AND id=?",(uid,gid))
             await groups_menu(update,core,uid)
         elif data.startswith('dx_ge_'):
