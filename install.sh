@@ -187,7 +187,7 @@ main() {
   install_system_dependencies
   create_config
   install_python_dependencies
-  ./venv/bin/python -m py_compile bot.py bot_ui.py bot_runtime.py cloudflare_api.py dns_advanced.py dns_group_clones.py
+  ./venv/bin/python -m py_compile bot.py bot_ui.py bot_runtime.py cloudflare_api.py dns_advanced.py dns_group_clones.py group_records.py
   ./venv/bin/python -c 'import bot; import dns_advanced; dns_advanced.initialize()'
   write_service
   start_service

@@ -80,6 +80,7 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         bot._DATA_CACHE.clear();bot.user_state.clear()
         adv.FEATURE_INPUT.clear();adv.PENDING.clear();adv.SEARCH_CACHE.clear();adv.BULK_SELECTION.clear()
         clones.PLANS.clear();clones.BUSY.clear();clones.DISCOVERIES.clear()
+        adv.group_records.VIEWS.clear()
         cf._invalidate_zones_cache();cf._invalidate_records_cache();cf._set_last_error(None)
         bot.load_users()
         bot.add_user(2);bot.set_user_access(2,[Z])
@@ -317,6 +318,130 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(update.message.frames[-1][1]),9)
         with patch.object(cf,'get_record_details_strict',side_effect=AssertionError('Summary should not fetch records')):
             await self.click('dx_g_'+G)
+
+    async def test_group_page_shows_live_original_and_clone_ips_with_actions(self):
+        await self.create('2.2.2.2')
+        update=await self.click('dx_g_'+G)
+        self.assertIn('1.1.1.1',update.message.text)
+        self.assertIn('2.2.2.2',update.message.text)
+        buttons=[b for row in update.message.frames[-1][1] for b in row]
+        self.assertTrue(any(b.callback_data=='dx_cnew_'+G for b in buttons))
+        self.assertEqual(sum(b.callback_data.startswith('dx_be_') for b in buttons),2)
+        self.assertEqual(sum(b.callback_data.startswith('dx_bd_') for b in buttons),2)
+        self.records[(Z,R)]['content']='9.9.9.9'
+        update=await self.click('dx_g_'+G)
+        self.assertIn('9.9.9.9',update.message.text)
+        self.assertNotIn('1.1.1.1',update.message.text)
+
+    async def test_group_page_edits_only_selected_original_ip_bucket(self):
+        await self.create('2.2.2.2')
+        second='f'*32
+        self.records[(Z,second)]=dict(self.records[(Z,R)],id=second,name='another.example.com')
+        with adv.db() as c:c.execute('INSERT INTO dns_group_members VALUES(?,?,?)',(G,Z,second))
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='original')
+        await self.click(f'dx_be_{view["token"]}_{index}')
+        await bot.handle_message(Update(text='8.8.8.8'),self.context)
+        self.assertEqual(self.records[(Z,R)]['content'],'1.1.1.1')
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertEqual(self.records[(Z,R)]['content'],'8.8.8.8')
+        self.assertEqual(self.records[(Z,second)]['content'],'8.8.8.8')
+        row=clones.rows(adv,1,G)[0]
+        self.assertEqual(self.records[(Z,row['record_id'])]['content'],'2.2.2.2')
+
+    async def test_group_page_edits_clone_and_updates_its_tracking(self):
+        rr=await self.create('2.2.2.2')
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone')
+        await self.click(f'dx_be_{view["token"]}_{index}')
+        await bot.handle_message(Update(text='7.7.7.7'),self.context)
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertEqual(self.records[(Z,R)]['content'],'1.1.1.1')
+        self.assertEqual(clones.rows(adv,1,G)[0]['ip'],'7.7.7.7')
+        update=await self.click('dx_g_'+G)
+        self.assertIn('7.7.7.7',update.message.text)
+        self.assertNotIn('2.2.2.2',update.message.text)
+
+    async def test_group_page_deletes_original_but_preserves_clones(self):
+        await self.create('2.2.2.2')
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='original')
+        update=await self.click(f'dx_bd_{view["token"]}_{index}')
+        self.assertIn('از Cloudflare حذف',update.message.text)
+        self.assertIn((Z,R),self.records)
+        token=adv.PENDING[1]['token']
+        await self.click('dx_apply_'+token)
+        self.assertNotIn((Z,R),self.records)
+        self.assertEqual(len(clones.rows(adv,1,G)),1)
+        self.assertEqual(len(adv.members(G)),0)
+        self.assertEqual(len(self.records),1)
+        writes=len(self.writes)
+        await self.click('dx_apply_'+token)
+        self.assertEqual(len(self.writes),writes)
+
+    async def test_group_page_can_delete_a_single_record_from_shared_ip(self):
+        second='f'*32
+        self.records[(Z,second)]=dict(self.records[(Z,R)],id=second,name='another.example.com')
+        with adv.db() as c:c.execute('INSERT INTO dns_group_members VALUES(?,?,?)',(G,Z,second))
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        await self.click(f'dx_br_{view["token"]}_0_0')
+        await self.click(f'dx_bone_{view["token"]}_0_0')
+        target=adv.PENDING[1]['items'][0][1]['id']
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertNotIn((Z,target),self.records)
+        self.assertEqual(len(self.records),1)
+        self.assertEqual(len(adv.members(G)),1)
+
+    async def test_group_page_delete_stops_if_record_changed_after_confirmation(self):
+        await self.create('2.2.2.2')
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone')
+        await self.click(f'dx_bd_{view["token"]}_{index}')
+        token=adv.PENDING[1]['token']
+        row=clones.rows(adv,1,G)[0]
+        self.records[(Z,row['record_id'])]['content']='9.9.9.9'
+        update=await self.click('dx_apply_'+token)
+        self.assertIn('هیچ تغییری اعمال نشد',update.message.text)
+        self.assertEqual(len(self.writes),1)
+
+    async def test_group_page_tokens_cannot_cross_users_or_outlive_refresh(self):
+        await self.click('dx_g_'+G)
+        token=adv.group_records.VIEWS[1]['token']
+        await self.click(f'dx_bd_{token}_0',2)
+        self.assertNotIn(2,adv.PENDING)
+        await self.click('dx_g_'+G)
+        await self.click(f'dx_bd_{token}_0')
+        self.assertNotIn(1,adv.PENDING)
+        self.assertEqual(self.writes,[])
+
+    async def test_group_page_invalid_ip_and_cancellation_do_not_mutate_dns(self):
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        await self.click(f'dx_be_{view["token"]}_0')
+        await bot.handle_message(Update(text='999.1.1.1'),self.context)
+        self.assertNotIn(1,adv.PENDING)
+        self.assertEqual(adv.FEATURE_INPUT[1]['mode'],'group_ip')
+        await bot.handle_message(Update(text='8.8.8.8'),self.context)
+        self.assertIn(1,adv.PENDING)
+        await self.click(f'dx_view_{G}_0')
+        self.assertNotIn(1,adv.PENDING)
+        self.assertEqual(self.writes,[])
+
+    async def test_group_page_clone_delete_preserves_original_and_other_clones(self):
+        await self.create()
+        await self.click('dx_g_'+G)
+        view=adv.group_records.VIEWS[1]
+        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone' and b[2]=='2.2.2.2')
+        await self.click(f'dx_bd_{view["token"]}_{index}')
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertIn((Z,R),self.records)
+        self.assertEqual(len(self.records),2)
+        self.assertEqual(clones.rows(adv,1,G)[0]['ip'],'3.3.3.3')
 
     async def test_proxy_enabled_always_uses_auto_ttl(self):
         self.assertTrue(cf.update_dns_record(Z,R,'node.example.com','A','1.1.1.1',300,True))

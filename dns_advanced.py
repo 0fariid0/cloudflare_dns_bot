@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import dns_group_clones as group_clones
+import group_records
 import ipaddress
 import json
 import logging
@@ -198,6 +199,8 @@ async def groups_menu(update, core, uid, page=0):
 
 
 async def group_menu(update, core, uid, gid, page=0, *, details=False):
+    if not details:
+        return await group_records.dashboard(update,core,sys.modules[__name__],uid,gid,page)
     g = group(uid, gid)
     if not g:
         await show(update, "گروه پیدا نشد یا مجاز نیست.", [back("dx_groups")]); return
@@ -206,34 +209,22 @@ async def group_menu(update, core, uid, gid, page=0, *, details=False):
     lines = [f"📁 {g['name']}", f"📋 {len(mm)} عضو اصلی • 🧬 {len(clones)} کلون",
              "ویرایش گروه فقط روی اعضای اصلی اعمال می‌شود."]
     keyboard = []
-    if details:
-        permitted = await zones_for(core, uid)
-        part,p = page_slice(mm,page)
-        semaphore = asyncio.Semaphore(4)
-        async def fetch(m):
-            if m['zone_id'] not in permitted: return None
-            async with semaphore:
-                try: return await asyncio.to_thread(cf.get_record_details_strict,m['zone_id'],m['record_id'])
-                except Exception as exc: return exc
-        results = await asyncio.gather(*(fetch(m) for m in part))
-        for m,r in zip(part,results):
-            if r is None:
-                lines.append('🔒 عضو خارج از دسترسی فعلی'); continue
-            if isinstance(r,Exception):
-                lines.append('⚠️ دریافت عضو ناموفق؛ رکورد حذف‌شده یا خطای ارتباطی')
-                label = 'عضو دریافت‌نشده'
-            else:
-                lines.append(f"• {txt(r['name'],45)} [{r['type']}] → {txt(r.get('content',''),40)}")
-                label = txt(r['name'],32)
-            keyboard.append([Button('➖ '+label,callback_data=f"dx_rm_{gid}_{m['record_id']}")])
-        keyboard += pager(p,len(mm),f"dx_gp_{gid}_") + [back(f"dx_g_{gid}")]
-    else:
-        if not mm: lines.append('برای شروع، «انتخاب اعضا» را بزنید.')
-        keyboard = [
-            [Button('📋 مشاهده اعضا',callback_data=f'dx_gp_{gid}_0'), Button('➕ انتخاب اعضا',callback_data=f'dx_addz_{gid}_0')],
-            [Button('✏️ ویرایش گروهی',callback_data=f'dx_ge_{gid}'), Button(f'🧬 کلون‌ها ({len(clones)})',callback_data=f'dx_cm_{gid}')],
-            [Button('🖊 تغییر نام',callback_data=f'dx_grename_{gid}'), Button('🗑 حذف گروه',callback_data=f'dx_gdelq_{gid}')],
-            back('dx_groups')]
+    permitted = await zones_for(core, uid)
+    part,p = page_slice(mm,page)
+    semaphore = asyncio.Semaphore(4)
+    async def fetch(m):
+        if m['zone_id'] not in permitted: return None
+        async with semaphore:
+            try: return await asyncio.to_thread(cf.get_record_details_strict,m['zone_id'],m['record_id'])
+            except Exception as exc: return exc
+    results = await asyncio.gather(*(fetch(m) for m in part))
+    for m,r in zip(part,results):
+        if r is None:
+            lines.append('🔒 عضو خارج از دسترسی فعلی'); continue
+        if isinstance(r,Exception):
+            lines.append('⚠️ دریافت عضو ناموفق؛ رکورد حذف‌شده یا خطای ارتباطی')
+            label = 'عضو دریافت‌نشده'
+
     await show(update,'\n'.join(lines),keyboard)
 
 
@@ -336,6 +327,8 @@ async def execute(update, core, uid, token):
     plan = PENDING.pop(uid,None)
     if not plan or plan['token'] != token or time.monotonic()-plan['at']>600:
         await show(update,"⏰ پیش‌نمایش منقضی شده است؛ دوباره انتخاب کنید.",[back("back_to_main")]);return
+    if plan.get('kind')=='group_records':
+        return await group_records.execute(update,core,sys.modules[__name__],uid,plan)
     gid=plan['gid']
     if gid and not group(uid,gid):
         await show(update,"گروه حذف شده است.",[back("dx_groups")]);return
@@ -601,6 +594,13 @@ async def handle_message(update,context,core):
     text=update.message.text.strip()
     mode=state['mode']
     FEATURE_INPUT.pop(uid,None)
+    if mode == 'group_ip':
+        try:
+            await group_records.preview(update,core,sys.modules[__name__],uid,state['view'],state['bucket'],'edit',text)
+        except Exception as exc:
+            FEATURE_INPUT[uid]=state
+            await show(update,'❌ '+txt(exc,300),[back(f"dx_view_{state['view']['gid']}_{state['view']['page']}")])
+        return True
     if mode == 'clone_ips':
         try:
             await group_clones.preview_create(update,core,sys.modules[__name__],uid,state['gid'],text)
@@ -681,6 +681,8 @@ async def handle_callback(update,context,core):
     # Forget only text-input state on navigation (maintain zone_pick/bulk selection flow).
     if not data.startswith(('dx_join_','dx_bs_','dx_madd_')):
         FEATURE_INPUT.pop(uid,None)
+    if await group_records.callback(update,context,core,sys.modules[__name__]):
+        return True
     if await group_clones.callback(update,context,core,sys.modules[__name__]):
         return True
     group_clones.PLANS.pop(uid,None)
