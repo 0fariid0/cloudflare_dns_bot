@@ -11,6 +11,7 @@ import httpx
 import ipaddress
 from telegram.error import BadRequest
 from bot_ui import render, compact_rows, page_items
+from bot_runtime import PerUserProcessor
 import cloudflare_api as cf
 from collections import defaultdict
 from enum import Enum, auto
@@ -124,6 +125,17 @@ def load_ip_lists():
 
 def save_ip_lists(ip_lists):
     save_data(IP_LIST_FILE, ip_lists)
+
+def merge_ip_pool_changes(before,after):
+    """Preserve reserve IPs added while a background ping was running."""
+    latest=load_ip_lists()
+    for key in ('reserve','deprecated'):
+        removed=set(before.get(key,[]))-set(after.get(key,[]))
+        added=[ip for ip in after.get(key,[]) if ip not in before.get(key,[])]
+        latest[key]=list(dict.fromkeys([ip for ip in latest.get(key,[]) if ip not in removed]+added))
+    latest['reserve']=[ip for ip in latest['reserve'] if ip not in latest['deprecated']]
+    save_ip_lists(latest)
+
 
 def load_smart_settings():
     return load_data(SMART_SETTINGS_FILE, {"auto_check_records": []})
@@ -413,6 +425,7 @@ async def refresh_known_user_profiles(context: ContextTypes.DEFAULT_TYPE, users)
             }
 
     results = await asyncio.gather(*(fetch_one(uid) for uid in missing_ids), return_exceptions=True)
+    users=load_users()  # Merge profiles into the current permissions, after network awaits.
     for result in results:
         if not result or isinstance(result, Exception):
             continue
@@ -558,12 +571,12 @@ def is_user_authorized(user_id):
     users = load_users()
     return str(user_id) in users
 
-def get_user_accessible_zones(user_id):
+def get_user_accessible_zones(user_id, *, strict=False):
     users = load_users()
     user_id_str = str(user_id)
     user_data = users.get(user_id_str)
     if not user_data: return []
-    all_zones = get_zones()
+    all_zones = get_zones_strict() if strict else get_zones()
     if user_data.get("access") == "all": return all_zones
     accessible_zone_ids = set(user_data.get("access", []))
     return [zone for zone in all_zones if zone["id"] in accessible_zone_ids]
@@ -705,6 +718,7 @@ def reset_user_state(uid, keep_zone=False):
         zone_name = current_state.get("zone_name")
         record_id = current_state.get("record_id")
         user_state[uid] = {"zone_id": zone_id, "zone_name": zone_name, "record_id": record_id}
+        if current_state.get("record_back"):user_state[uid]["record_back"]=current_state["record_back"]
     else:
         user_state.pop(uid, None)
 
@@ -718,25 +732,33 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = get_last_error()
     with dns_adv.db() as c:
         groups = c.execute("SELECT id,name FROM dns_groups WHERE owner=? ORDER BY name", (uid,)).fetchall()
-    entries = [(f"📁 {g['name'][:28]}", f"dx_g_{g['id']}") for g in groups]
-    entries += [(f"{'🌐' if z.get('status') == 'active' else '⏳'} {z['name'][:32]}", f"zone_{z['id']}") for z in sorted(zones, key=lambda z: z['name'])]
-    part, navigation, page = page_items(entries, context, 'home')
-    keyboard = compact_rows([InlineKeyboardButton(label, callback_data=data) for label, data in part]) + navigation
-    keyboard += [
-        [InlineKeyboardButton("📁 گروه‌ها", callback_data="dx_groups"), InlineKeyboardButton("🔁 تغییر گروهی", callback_data="dx_bulk")],
-        [InlineKeyboardButton("🔎 جست‌وجو", callback_data="dx_search"), InlineKeyboardButton("📡 مانیتورینگ", callback_data="dx_monitor")],
-        [InlineKeyboardButton("📜 تاریخچه", callback_data="dx_history"), InlineKeyboardButton("🔄 تازه‌سازی", callback_data="refresh_domains")],
-    ]
-    if uid == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ مدیریت", callback_data="ui_admin"), InlineKeyboardButton("ℹ️ راهنما", callback_data="show_help")])
-    else:
-        keyboard.append([InlineKeyboardButton("ℹ️ راهنما", callback_data="show_help")])
-    text = f"🏠 مدیریت DNS\n🌐 {len(zones)} دامنه  •  📁 {len(groups)} گروه\nدامنه یا گروه موردنظر را انتخاب کنید."
-    if error:
-        text += f"\n⚠️ دریافت دامنه‌ها ناموفق بود: {str(error)[:350]}"
-    elif not entries:
-        text += "\nدامنه‌ای در دسترس نیست؛ می‌توانید گروه بسازید."
-    await render(update, text, keyboard)
+    with dns_adv.db() as c:
+        clone_count = c.execute("SELECT COUNT(*) FROM dns_group_clones WHERE owner=?",(uid,)).fetchone()[0]
+    keyboard = [
+        [InlineKeyboardButton(f"🌐 دامنه‌ها ({len(zones)})",callback_data='ui_domains'), InlineKeyboardButton(f"📁 گروه‌ها ({len(groups)})",callback_data='dx_groups')],
+        [InlineKeyboardButton(f"🧬 مرکز کلون‌ها ({clone_count})",callback_data='dx_clones')],
+        [InlineKeyboardButton('🔁 تغییر گروهی',callback_data='dx_bulk'),InlineKeyboardButton('🔎 جست‌وجوی DNS',callback_data='dx_search')],
+        [InlineKeyboardButton('📡 مانیتورینگ',callback_data='dx_monitor'),InlineKeyboardButton('📜 تاریخچه تغییرات',callback_data='dx_history')],
+        [InlineKeyboardButton('🔄 تازه‌سازی',callback_data='refresh_domains'),InlineKeyboardButton('ℹ️ راهنما',callback_data='show_help')]]
+    if uid==ADMIN_ID:keyboard.append([InlineKeyboardButton('⚙️ مدیریت کاربران و ربات',callback_data='ui_admin')])
+    text='🏠 مدیریت DNS\nبخش موردنظر را انتخاب کنید.\nکلون‌ها و گروه‌ها هرکدام بخش جداگانه دارند.'
+    if error:text+=f"\n⚠️ دریافت دامنه‌ها ناموفق بود: {str(error)[:300]}"
+    await render(update,text,keyboard)
+
+
+async def show_domains_menu(update,context):
+    uid=update.effective_user.id
+    reset_user_state(uid)
+    zones=await asyncio.to_thread(get_user_accessible_zones,uid)
+    error=get_last_error()
+    zones=sorted(zones,key=lambda z:z['name'])
+    part,nav,_=page_items(zones,context,'domains')
+    kb=compact_rows([InlineKeyboardButton(('🌐 ' if z.get('status')=='active' else '⏳ ')+z['name'][:40],callback_data=f"zone_{z['id']}") for z in part])
+    kb+=nav+[[InlineKeyboardButton('🔄 تازه‌سازی',callback_data='ui_domains_refresh'),InlineKeyboardButton('🏠 خانه',callback_data='back_to_main')]]
+    text=f'🌐 دامنه‌ها ({len(zones)})\nدامنه را برای مدیریت رکوردهایش انتخاب کنید.'
+    if error:text+=f'\n❌ {str(error)[:300]}'
+    elif not zones:text+='\nدامنه‌ای در دسترس نیست.'
+    await render(update,text,kb)
 
 async def show_admin_menu(update, context):
     reset_user_state(update.effective_user.id)
@@ -961,7 +983,7 @@ async def show_records_list(update, context):
         lines.append(f"{i}. {short[:65]} [{r['type']}] → {r['content'][:100]}")
         keyboard.append(InlineKeyboardButton(f"{icon} {short[:24]} · {r['type']}", callback_data=f"record_settings_{r['id']}"))
     rows = compact_rows(keyboard) + nav
-    rows += [[InlineKeyboardButton("➕ رکورد جدید", callback_data="add_record"), InlineKeyboardButton("🔄 تازه‌سازی", callback_data="refresh_records")], [InlineKeyboardButton("🏠 دامنه‌ها و گروه‌ها", callback_data="back_to_main")]]
+    rows += [[InlineKeyboardButton("➕ رکورد جدید", callback_data="add_record"), InlineKeyboardButton("🔄 تازه‌سازی", callback_data="refresh_records")], [InlineKeyboardButton("🔙 دامنه‌ها", callback_data="ui_domains"), InlineKeyboardButton("🏠 خانه", callback_data="back_to_main")]]
     if error: lines.append(f"❌ {str(error)[:300]}")
     elif not records: lines.append('رکورد قابل مدیریت وجود ندارد.')
     await render(update, "\n".join(lines), rows)
@@ -993,10 +1015,10 @@ async def show_record_settings(message, uid, zone_id, record_id):
     action_row = []
     if record['type'] == 'A' and record.get('proxied') == False:
         action_row.append(InlineKeyboardButton("🤖 اتصال هوشمند", callback_data=f"smart_menu_{record_id}"))
-    if record['type'] == 'A': action_row.append(InlineKeyboardButton("🐑 کلون", callback_data=f"clone_record_{record_id}"))
+    if record['type'] in ('A','AAAA'): action_row.append(InlineKeyboardButton("🐑 کلون", callback_data=f"clone_record_{record_id}"))
     action_row.append(InlineKeyboardButton("🗑️ حذف", callback_data=f"confirm_delete_record_{record_id}"))
     if action_row: keyboard.extend(compact_rows(action_row))
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_records")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=user_state[uid].get("record_back","back_to_records"))])
     await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, record_id: str):
@@ -1013,6 +1035,9 @@ async def show_smart_connection_menu(update: Update, context: ContextTypes.DEFAU
     auto_check_text = "✅ فعال" if is_auto_check_enabled else "❌ غیرفعال"
     
     record_details = (await asyncio.to_thread(get_record_details, zone_id, record_id))
+    if not record_details:
+        await render(update,"❌ دریافت رکورد ناموفق بود؛ دوباره تلاش کنید.",[[InlineKeyboardButton("🔙 رکوردها",callback_data="back_to_records")]])
+        return
     text = f"🤖 اتصال هوشمند\n{record_details.get('name', '')}\nبررسی IP و جایگزینی از لیست رزرو در صورت خرابی تأییدشده."
     
     keyboard = [
@@ -1056,7 +1081,15 @@ async def show_interval_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = "این ربات برای مدیریت رکوردهای DNS در Cloudflare طراحی شده است."
+    help_text = ("ℹ️ راهنمای مدیریت DNS\n\n"
+        "🌐 دامنه‌ها: مشاهده، ایجاد و ویرایش رکوردها.\n"
+        "📁 گروه‌ها: انتخاب چند رکورد از دامنه‌های مختلف و ویرایش یکجای آن‌ها.\n"
+        "🧬 مرکز کلون‌ها: تمام کلون‌های ثبت‌شده بر اساس گروه یا IP؛ مشاهده، ویرایش و حذف با تأیید.\n"
+        "🔎 کلون‌های قدیمی: شناسایی رکوردهای هم‌نام؛ نتیجه اسکن به‌تنهایی اثبات کلون بودن نیست.\n"
+        "🔁 تغییر گروهی: انتخاب آزاد رکوردها و تغییر IP با پیش‌نمایش.\n"
+        "📡 مانیتورینگ: بررسی DNS و پورت مقصد و ارسال هشدار؛ بدون تغییر DNS.\n"
+        "🤖 اتصال هوشمند: از تنظیمات رکورد A بدون پروکسی، برای جایگزینی خودکار IP.\n\n"
+        "برای لغو ورودی و بازگشت به خانه /cancel یا /start را بفرستید.")
     await update.effective_message.edit_text(help_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]]))
 
 async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1197,27 +1230,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif mode == State.CLONING_NEW_IP:
-        new_ip = text; clone_data = user_state[uid].get("clone_data", {}); zone_id = state.get("zone_id"); full_name = clone_data.get("name")
-        if not all([new_ip, clone_data, zone_id, full_name]):
-            await update.message.reply_text("❌ خطای داخلی."); reset_user_state(uid, keep_zone=True); return
-        await update.message.reply_text(f"⏳ در حال افزودن IP `{new_ip}`..." )
-        try:
-            if (await asyncio.to_thread(create_dns_record, zone_id, clone_data["type"], full_name, new_ip, clone_data["ttl"], clone_data["proxied"])):
-                log_action(uid, f"CREATE (Clone) record '{full_name}' with IP '{new_ip}'")
-                await update.message.reply_text("✅ رکورد جدید با موفقیت اضافه شد.")
-            else: await update.message.reply_text("❌ عملیات ناموفق بود.")
-        except Exception as e: logger.error(f"Error creating cloned record: {e}"); await update.message.reply_text("❌ خطا در ارتباط با API.")
-        finally:
-            # بازگشت خودکار به منوی قبلی (تنظیمات همان رکورد)
-            original_record_id = state.get("record_id")
-            reset_user_state(uid, keep_zone=True)
-            if original_record_id and zone_id:
-                new_msg = await update.message.reply_text("↩️ بازگشت به منوی رکورد...")
-                await show_record_settings(new_msg, uid, zone_id, original_record_id)
-            else:
-                await show_records_list(update, context)
+        await update.message.reply_text('این فرم قدیمی است؛ دوباره از تنظیمات رکورد، کلون را انتخاب کنید.')
+        reset_user_state(uid,keep_zone=True)
+        await show_records_list(update,context)
         return
-            
 
     elif mode == State.EDITING_IP:
         new_content = text; record_id = state.get("record_id"); zone_id = state.get("zone_id")
@@ -1289,6 +1305,7 @@ async def run_smart_check_logic(context, zone_id, record_id, user_id):
             if user_id: await notify_user(context, target, '✅ IP فعلی پاسخ‌گو است.\n' + report[:2500])
             return
         pool = load_ip_lists()
+        original_pool=copy.deepcopy(pool)
         chosen = None
         for candidate in list(pool.get('reserve', [])):
             if candidate == record['content']: continue
@@ -1305,7 +1322,7 @@ async def run_smart_check_logic(context, zone_id, record_id, user_id):
             live = await asyncio.to_thread(get_record_details, zone_id, record_id)
             if not live or dns_adv.key_fields(live) != dns_adv.key_fields(record):
                 await notify_user(context, target, '⚠️ رکورد هم‌زمان تغییر کرده؛ جایگزینی انجام نشد.')
-                save_ip_lists(pool)
+                merge_ip_pool_changes(original_pool,pool)
                 return
             changed = await asyncio.to_thread(update_dns_record, zone_id, record_id, record['name'], record['type'], candidate, record['ttl'], False)
             if changed:
@@ -1315,7 +1332,7 @@ async def run_smart_check_logic(context, zone_id, record_id, user_id):
                 chosen = candidate
             # On Cloudflare failure keep the healthy reserve available for a retry.
             break
-        save_ip_lists(pool)
+        merge_ip_pool_changes(original_pool,pool)
         text = f"✅ اتصال هوشمند: {record['name']}\n{record['content']} → {chosen}" if chosen else f"⚠️ {record['name']}\nجایگزین سالم اعمال نشد؛ IP فعلی تغییر نکرد."
         await notify_user(context, target, text)
         log_action(user_id or 'Auto', f"Smart check for {record['name']}: {chosen or 'unchanged'}")
@@ -1343,6 +1360,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(uid):
         await show_request_access_menu(update, context); return
     update_known_user_profile(query.from_user)
+    if not data.startswith(('dx_apply_','dx_capply_')):
+        dns_adv.PENDING.pop(uid,None)
+        dns_adv.group_clones.PLANS.pop(uid,None)
+    if data.startswith('ui_'):
+        dns_adv.FEATURE_INPUT.pop(uid,None)
 
     if data.startswith(('delete_zone_', 'confirm_delete_zone_')) or data in ('delete_domain_menu', 'ui_admin'):
         if uid != ADMIN_ID:
@@ -1350,9 +1372,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     if data.startswith('ui_page_'):
         section, raw_page = data[len('ui_page_'):].rsplit('_', 1)
-        routes = {'home': show_main_menu, 'records': show_records_list, 'users': manage_whitelist_menu,
+        routes = {'home': show_main_menu, 'domains': show_domains_menu, 'records': show_records_list, 'users': manage_whitelist_menu,
                   'blocked': manage_blacklist_menu, 'requests': manage_requests_menu, 'deletezones': show_delete_domain_menu, 'access': manage_user_access_menu, 'reserve': show_ip_pool, 'deprecated': show_ip_pool}
-        if section not in routes or (section not in ('home', 'records', 'reserve', 'deprecated') and uid != ADMIN_ID):
+        if section not in routes or (section not in ('home', 'domains', 'records', 'reserve', 'deprecated') and uid != ADMIN_ID):
             return
         if not raw_page.isdigit(): return
         context.user_data['page_' + section] = int(raw_page)
@@ -1362,6 +1384,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_main_menu(update, context)
                 return
         await routes[section](update, context)
+        return
+    if data in ('ui_domains','ui_domains_refresh'):
+        dns_adv.FEATURE_INPUT.pop(uid,None)
+        dns_adv.PENDING.pop(uid,None)
+        dns_adv.group_clones.PLANS.pop(uid,None)
+        if data=='ui_domains_refresh':cf._invalidate_zones_cache()
+        await show_domains_menu(update,context)
         return
     if data == 'ui_admin':
         await show_admin_menu(update, context)
@@ -1661,11 +1690,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_smart_connection_menu(update, context, record_id)
             
     elif data.startswith("clone_record_"):
-        record_id = data.split("_")[-1]; original_record = (await asyncio.to_thread(get_record_details, zone_id, record_id))
-        if not original_record: await query.answer("❌ رکورد اصلی یافت نشد.", show_alert=True); return
-        user_state[uid]["clone_data"] = { "name": original_record["name"], "type": original_record["type"], "ttl": original_record["ttl"], "proxied": original_record.get("proxied", False) }
-        user_state[uid]["mode"] = State.CLONING_NEW_IP
-        await query.message.edit_text(f"🐑 **کلون کردن رکورد**\n`{original_record['name']}`\n\nلطفاً **IP جدید** را وارد کنید:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_action")]]))
+        record_id=data.split('_')[-1]
+        reset_user_state(uid,keep_zone=True)
+        await dns_adv.group_clones.start_single(update,sys.modules[__name__],dns_adv,uid,zone_id,record_id)
     elif data.startswith("toggle_proxy_"):
         record_id = data.split("_")[-1]; record_details = (await asyncio.to_thread(get_record_details, zone_id, record_id))
         if (await asyncio.to_thread(toggle_proxied_status, zone_id, record_id)):
@@ -1789,10 +1816,11 @@ async def dns_monitor_tick(context):
 
 def main():
     dns_adv.initialize()
+    cf.WRITE_OBSERVER = dns_adv.sync_tracked_record
     load_users(); load_blocked_users(); load_requests(); load_ip_lists(); load_smart_settings()
     logger.info("Starting bot...")
     
-    app_builder = Application.builder().token(BOT_TOKEN)
+    app_builder = Application.builder().token(BOT_TOKEN).concurrent_updates(PerUserProcessor(8))
     job_queue = JobQueue()
     app_builder.job_queue(job_queue)
     app = app_builder.build()
@@ -1811,7 +1839,7 @@ def main():
             sync_smart_job(job_queue, zone_id, record_id, record_config)
     
     app.add_error_handler(handle_error)
-    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler(["start", "cancel"], start_command))
     app.add_handler(CommandHandler("logs", show_logs))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

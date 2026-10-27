@@ -12,6 +12,9 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
+import copy
+from bot_runtime import api_error_scope
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -23,31 +26,37 @@ from config import CLOUDFLARE_API_KEY, CLOUDFLARE_EMAIL
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.cloudflare.com/client/v4"
-_DEFAULT_TIMEOUT: Tuple[int, int] = (8, 25)
+_DEFAULT_TIMEOUT: Tuple[int, int] = (5, 15)
 _CACHE_TTL_SECONDS = 20
 
 # Stores the last Cloudflare error message (used by the bot UI to show a helpful message)
-_LAST_ERROR: Optional[str] = None
+WRITE_OBSERVER = None
 _ZONES_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
 _RECORDS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # Cloudflare Global API Key is 37 hex characters.
 _GLOBAL_KEY_RE = re.compile(r"^[a-f0-9]{37}$", re.IGNORECASE)
 
-_SESSION = requests.Session()
-_RETRY = Retry(
-    total=2,
-    connect=2,
-    read=2,
-    status=2,
-    backoff_factor=0.35,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "PUT", "PATCH", "DELETE"]),
-    raise_on_status=False,
-)
-_ADAPTER = HTTPAdapter(max_retries=_RETRY, pool_connections=10, pool_maxsize=20)
-_SESSION.mount("https://", _ADAPTER)
-_SESSION.mount("http://", _ADAPTER)
+class BoundedRetry(Retry):
+    def get_retry_after(self, response):
+        value = super().get_retry_after(response)
+        return min(value, 5) if value is not None else None
+
+
+_LOCAL = threading.local()
+
+
+def _session():
+    # requests.Session is not shared between worker threads.
+    if not hasattr(_LOCAL, 'session'):
+        session = requests.Session()
+        retry = BoundedRetry(total=1, connect=1, read=1, status=1,
+            backoff_factor=0.35, status_forcelist=(429,500,502,503,504),
+            allowed_methods=frozenset(['GET']), raise_on_status=False)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4,pool_maxsize=4)
+        session.mount('https://',adapter)
+        _LOCAL.session=session
+    return _LOCAL.session
 
 
 class CloudflareAPIError(RuntimeError):
@@ -59,12 +68,14 @@ class CloudflareAPIError(RuntimeError):
 
 def get_last_error() -> Optional[str]:
     """Return last Cloudflare API error message (if any)."""
-    return _LAST_ERROR
+    scope = api_error_scope.get()
+    return scope.get("error") if scope is not None else getattr(_LOCAL,"error",None)
 
 
 def _set_last_error(err: Optional[str]) -> None:
-    global _LAST_ERROR
-    _LAST_ERROR = err
+    scope = api_error_scope.get()
+    if scope is not None:scope["error"]=err
+    _LOCAL.error=err
 
 
 def _cache_get(cache: Dict[str, Any], key: str = "data"):
@@ -127,7 +138,7 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
     headers = _auth_headers()
 
     try:
-        resp = _SESSION.request(method, url, headers=headers, params=params, json=json, timeout=_DEFAULT_TIMEOUT)
+        resp = _session().request(method, url, headers=headers, params=params, json=json, timeout=_DEFAULT_TIMEOUT)
     except requests.RequestException as e:
         _set_last_error(f"خطا در ارتباط با Cloudflare: {e}")
         raise CloudflareAPIError(f"خطا در ارتباط با Cloudflare: {e}") from e
@@ -141,6 +152,10 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
             f"پاسخ نامعتبر از Cloudflare (status={resp.status_code}).",
             status_code=resp.status_code,
         )
+
+    if not isinstance(data, dict):
+        _set_last_error("ساختار پاسخ Cloudflare نامعتبر است.")
+        raise CloudflareAPIError(get_last_error(),status_code=resp.status_code)
 
     if resp.status_code >= 400 or not data.get("success", False):
         errors = data.get("errors") or []
@@ -157,6 +172,14 @@ def _request(method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
         raise CloudflareAPIError(msg, status_code=resp.status_code, errors=errors)
 
     _set_last_error(None)
+    if WRITE_OBSERVER and method in ('PATCH','PUT','DELETE'):
+        match=re.fullmatch(r'/zones/([^/]+)/dns_records/([^/]+)',path)
+        if match:
+            try:
+                if method=='DELETE':WRITE_OBSERVER(match[1],match[2],None)
+                elif isinstance(data.get('result'),dict):WRITE_OBSERVER(match[1],match[2],data['result'])
+                else:logger.warning('Successful DNS write did not include a record snapshot')
+            except Exception:logger.exception('Cannot synchronize local clone tracking')
     return data
 
 
@@ -170,6 +193,7 @@ def _paginate(path: str, *, params: Optional[Dict[str, Any]] = None, per_page: i
 
         data = _request("GET", path, params=merged_params)
         items = data.get("result") or []
+        if not isinstance(items,list):raise CloudflareAPIError("فهرست Cloudflare نامعتبر است.")
         out.extend(items)
 
         info = data.get("result_info") or {}
@@ -191,7 +215,8 @@ def get_zones() -> List[Dict[str, Any]]:
     """Return all zones accessible by the configured credentials."""
     cached = _cache_get(_ZONES_CACHE)
     if cached is not None:
-        return list(cached)
+        _set_last_error(None)
+        return copy.deepcopy(cached)
 
     try:
         zones = _paginate("/zones", per_page=50)
@@ -199,6 +224,16 @@ def get_zones() -> List[Dict[str, Any]]:
         return zones
     except CloudflareAPIError:
         return []
+
+
+def get_zones_strict():
+    cached=_cache_get(_ZONES_CACHE)
+    if cached is not None:
+        _set_last_error(None)
+        return copy.deepcopy(cached)
+    zones=_paginate('/zones',per_page=50)
+    _cache_set(_ZONES_CACHE,copy.deepcopy(zones))
+    return zones
 
 
 def get_zone_info(domain_name: str) -> Optional[Dict[str, Any]]:
@@ -248,7 +283,8 @@ def get_dns_records(zone_id: str) -> List[Dict[str, Any]]:
     if cached_bucket:
         cached = _cache_get(cached_bucket)
         if cached is not None:
-            return list(cached)
+            _set_last_error(None)
+            return copy.deepcopy(cached)
 
     try:
         records = _paginate(f"/zones/{zone_id}/dns_records")
@@ -302,7 +338,7 @@ def update_dns_record(zone_id: str, record_id: str, name: str, type_: str, conte
         if old.get("name") != name or old.get("type") != type_:
             # Legacy compatibility for name/type edits (not used by current UI).
             payload = {"type": type_, "name": name, "content": content,
-                       "ttl": ttl, "proxied": proxied}
+                       "ttl": 1 if proxied else ttl, "proxied": proxied}
             for extra in ("comment", "tags", "settings"):
                 if extra in old:
                     payload[extra] = old[extra]
@@ -312,6 +348,7 @@ def update_dns_record(zone_id: str, record_id: str, name: str, type_: str, conte
             for field, value in (("content", content), ("ttl", int(ttl)), ("proxied", bool(proxied))):
                 if old.get(field) != value:
                     changes[field] = value
+            if proxied:changes["ttl"]=1
             if changes:
                 _request("PATCH", f"/zones/{zone_id}/dns_records/{record_id}", json=changes)
         _invalidate_records_cache(zone_id)

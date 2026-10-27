@@ -88,7 +88,10 @@ PY_SQLITE
           return 1
         fi
       else
-        cp -a "$source_dir/$file" "$backup_dir/"
+        if ! cp -a "$source_dir/$file" "$backup_dir/"; then
+          echo "[ERROR] Backup copy failed: $file" >&2
+          return 1
+        fi
       fi
       copied=$((copied + 1))
     fi
@@ -117,7 +120,11 @@ restore_backup() {
 }
 
 safe_stop_service() {
-  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    systemctl stop "$SERVICE_NAME"
+  else
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
 }
 
 run_installer() {
@@ -132,24 +139,57 @@ run_installer() {
 install_bot() {
   info "Starting safe install..."
   install_bootstrap_dependencies
-
-  local backup_dir=""
+  mkdir -p "$(dirname "$INSTALL_DIR")"
+  local staged previous backup_dir=""
+  staged="$(mktemp -d "${INSTALL_DIR}.stage.XXXXXX")"
+  # Download and validate before touching the running installation.
+  if ! git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$staged"; then
+    rm -rf "$staged"
+    warn "Download failed. Existing installation was not changed."
+    return 1
+  fi
+  if [[ ! -s "$staged/bot.py" || ! -s "$staged/install.sh" || ! -s "$staged/requirements.txt" ]]; then
+    rm -rf "$staged"
+    warn "Downloaded source is incomplete. Existing installation was not changed."
+    return 1
+  fi
+  if ! safe_stop_service; then
+    rm -rf "$staged"
+    warn "Cannot stop existing service. Installation aborted."
+    return 1
+  fi
   if [[ -d "$INSTALL_DIR" ]]; then
     backup_dir="$(create_backup "$INSTALL_DIR" || true)"
-    if [[ -f "$INSTALL_DIR/dns_advanced.sqlite3" && ( -z "$backup_dir" || ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
-      echo "[ERROR] DNS group/history database backup failed. Installation aborted." >&2
-      return 1
+    if [[ -f "$INSTALL_DIR/config.py" || -f "$INSTALL_DIR/dns_advanced.sqlite3" ]]; then
+      if [[ -z "$backup_dir" ]]; then
+        rm -rf "$staged"
+        systemctl start "$SERVICE_NAME" || true
+        warn "Backup failed. Installation aborted."
+        return 1
+      fi
     fi
-    [[ -n "$backup_dir" ]] && success "Previous config backup: $backup_dir"
+    previous="$(mktemp -d "${INSTALL_DIR}.previous.XXXXXX")"
+    rmdir "$previous"
+    mv "$INSTALL_DIR" "$previous"
+  else
+    previous=""
   fi
-
+  mv "$staged" "$INSTALL_DIR"
+  if restore_backup "$backup_dir" && run_installer; then
+    [[ -z "$previous" ]] || rm -rf "$previous"
+    success "Installation completed."
+    pause
+    return 0
+  fi
+  warn "Installation failed. Restoring previous source."
   safe_stop_service
-  rm -rf "$INSTALL_DIR"
-  git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
-  restore_backup "$backup_dir"
-  run_installer
-  success "Installation completed."
-  pause
+  if [[ -n "$previous" ]]; then
+    # Retain the failed source for troubleshooting; never delete runtime data.
+    mv "$INSTALL_DIR" "${INSTALL_DIR}.failed.$(date +%Y%m%d-%H%M%S)"
+    mv "$previous" "$INSTALL_DIR"
+    run_installer || warn "Previous service could not be restarted. Check logs."
+  fi
+  return 1
 }
 
 configure_bot() {
@@ -175,12 +215,7 @@ update_bot() {
   info "Starting safe update..."
   install_bootstrap_dependencies
 
-  local backup_dir="$(create_backup "$INSTALL_DIR" || true)"
-  if [[ -f "$INSTALL_DIR/dns_advanced.sqlite3" && ( -z "$backup_dir" || ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
-    echo "[ERROR] DNS database backup failed. Update aborted." >&2
-    return 1
-  fi
-  [[ -n "$backup_dir" ]] && success "Backup before update: $backup_dir"
+  local backup_dir=""
 
   cd "$INSTALL_DIR" || return 1
   local old_commit
@@ -191,7 +226,18 @@ update_bot() {
     return 1
   fi
 
-  safe_stop_service
+  if ! safe_stop_service; then
+    warn "Cannot stop existing service. Update aborted."
+    return 1
+  fi
+  backup_dir="$(create_backup "$INSTALL_DIR" || true)"
+  if [[ -z "$backup_dir" || ! -f "$backup_dir/config.py" || ( -f "$INSTALL_DIR/dns_advanced.sqlite3" && ! -f "$backup_dir/dns_advanced.sqlite3" ) ]]; then
+    systemctl start "$SERVICE_NAME" || true
+    warn "Backup failed. Existing source was not changed."
+    return 1
+  fi
+  success "Backup before update: $backup_dir"
+
   if git reset --hard "origin/${BRANCH}" && restore_backup "$backup_dir" && run_installer; then
     success "Update completed."
     pause
@@ -253,6 +299,11 @@ uninstall_bot() {
 
 main() {
   require_root
+  case "$INSTALL_DIR" in
+    /|/root|/home|/usr|/opt|/etc|/var|/tmp|/workspace|""|*/../*|*/..|*/.) echo "[ERROR] Unsafe install directory." >&2; exit 1 ;;
+    /*) ;;
+    *) echo "[ERROR] INSTALL_DIR must be an absolute application directory." >&2; exit 1 ;;
+  esac
   while true; do
     show_menu
     case "${choice:-}" in

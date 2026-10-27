@@ -168,11 +168,12 @@ EOF_SERVICE
 start_service() {
   info "Starting service..."
   systemctl restart "$SERVICE_NAME"
-  sleep 1
+  sleep 3
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     success "Service is active."
   else
     warn "Service was started but is not active. Check logs: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
+    return 1
   fi
 }
 
@@ -186,6 +187,8 @@ main() {
   install_system_dependencies
   create_config
   install_python_dependencies
+  ./venv/bin/python -m py_compile bot.py bot_ui.py bot_runtime.py cloudflare_api.py dns_advanced.py dns_group_clones.py
+  ./venv/bin/python -c 'import bot; import dns_advanced; dns_advanced.initialize()'
   write_service
   start_service
 

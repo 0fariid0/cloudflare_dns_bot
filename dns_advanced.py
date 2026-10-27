@@ -93,6 +93,18 @@ def initialize():
     group_clones.initialize(sys.modules[__name__])
 
 
+def sync_tracked_record(zone_id,record_id,record):
+    """Keep internally edited clones manageable; external edits still need review."""
+    with db() as c:
+        if record is None:
+            c.execute('DELETE FROM dns_group_clones WHERE zone_id=? AND record_id=?',(zone_id,record_id))
+            c.execute('DELETE FROM dns_group_members WHERE zone_id=? AND record_id=?',(zone_id,record_id))
+            c.execute('DELETE FROM dns_monitors WHERE zone_id=? AND record_id=?',(zone_id,record_id))
+        elif isinstance(record,dict) and all(k in record for k in ('name','type','content')):
+            c.execute('UPDATE dns_group_clones SET ip=?,name=?,type=?,snapshot=? WHERE zone_id=? AND record_id=?',
+                      (record['content'],record['name'],record['type'],json.dumps(record),zone_id,record_id))
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -129,16 +141,17 @@ def members(group_id):
         return c.execute("SELECT zone_id,record_id FROM dns_group_members WHERE group_id=? ORDER BY rowid", (group_id,)).fetchall()
 
 
-def zones_for(core, uid):
-    return {str(z["id"]): z for z in core.get_user_accessible_zones(uid)}
+async def zones_for(core, uid):
+    zones = await asyncio.to_thread(core.get_user_accessible_zones, uid, strict=True)
+    return {str(z["id"]): z for z in zones}
 
 
-def allowed(core, uid, zone_id):
-    return str(zone_id) in zones_for(core, uid)
+async def allowed(core, uid, zone_id):
+    return str(zone_id) in await zones_for(core, uid)
 
 
 def back(data):
-    return [Button("🔙 بازگشت", callback_data=data)]
+    return [Button("🔙 بازگشت", callback_data=data)] + ([] if data=="back_to_main" else [Button("🏠 خانه",callback_data="back_to_main")])
 
 
 def txt(s, n=48):
@@ -173,44 +186,60 @@ def pager(page, count, prefix):
 
 async def groups_menu(update, core, uid, page=0):
     with db() as c:
-        rows = c.execute("SELECT * FROM dns_groups WHERE owner=? ORDER BY name", (uid,)).fetchall()
+        rows = c.execute("""SELECT g.*,
+            (SELECT COUNT(*) FROM dns_group_members m WHERE m.group_id=g.id) member_count,
+            (SELECT COUNT(*) FROM dns_group_clones cl WHERE cl.group_id=g.id AND cl.owner=g.owner) clone_count
+            FROM dns_groups g WHERE owner=? ORDER BY name""", (uid,)).fetchall()
     items,p = page_slice(rows,page)
-    keyboard = compact_rows([row[0] for row in [[Button(f"📁 {txt(row['name'], 42)}", callback_data=f"dx_g_{row['id']}")] for row in items]])
+    keyboard = compact_rows([row[0] for row in [[Button(f"📁 {txt(row['name'], 25)} · {row['member_count']} عضو / {row['clone_count']} کلون", callback_data=f"dx_g_{row['id']}")] for row in items]])
     keyboard += pager(p,len(rows),"dx_groups_")
-    keyboard += [[Button("➕ ساخت گروه جدید", callback_data="dx_gnew")], back("back_to_main")]
+    keyboard += [[Button("➕ ساخت گروه", callback_data="dx_gnew"), Button("🧬 همه کلون‌ها", callback_data="dx_clones")], back("back_to_main")]
     await show(update, f"📁 گروه‌های DNS ({len(rows)})\nبا انتخاب گروه، رکوردهای عضو و تنظیمات گروهی را مدیریت کنید.", keyboard)
 
 
-async def group_menu(update, core, uid, gid, page=0):
+async def group_menu(update, core, uid, gid, page=0, *, details=False):
     g = group(uid, gid)
     if not g:
         await show(update, "گروه پیدا نشد یا مجاز نیست.", [back("dx_groups")]); return
-    permitted = zones_for(core, uid)
     mm = members(gid)
-    lines = [f"📁 گروه: {g['name']}", f"👥 تعداد رکوردها: {len(mm)}", ""]
+    clones = group_clones.rows(sys.modules[__name__], uid, gid)
+    lines = [f"📁 {g['name']}", f"📋 {len(mm)} عضو اصلی • 🧬 {len(clones)} کلون",
+             "ویرایش گروه فقط روی اعضای اصلی اعمال می‌شود."]
     keyboard = []
-    part,p = page_slice(mm,page)
-    for m in part:
-        if m["zone_id"] not in permitted:
-            lines.append("🔒 عضو خارج از دسترسی فعلی")
-            continue
-        try:
-            r = await asyncio.to_thread(cf.get_record_details_strict, m["zone_id"], m["record_id"])
-            lines.append(f"• {name_of(m['zone_id'],r)} ({r['type']}) = {txt(r.get('content',''),26)}")
-            keyboard.append([Button(f"➖ حذف {txt(r['name'],30)} از گروه", callback_data=f"dx_rm_{gid}_{r['id']}")])
-        except Exception:
-            lines.append("⚠️ رکورد حذف شده یا دریافت ناموفق")
-            keyboard.append([Button("➖ حذف عضو نامعتبر", callback_data=f"dx_rm_{gid}_{m['record_id']}")])
-    keyboard += pager(p,len(mm),f"dx_gp_{gid}_")
-    keyboard += [[Button("🧬 کلون‌های گروه", callback_data=f"dx_cm_{gid}")]]
-    keyboard += [[Button("➕ عضو جدید", callback_data=f"dx_addz_{gid}_0"), Button("✏️ ویرایش اعضا", callback_data=f"dx_ge_{gid}")],
-                 [Button("🖊 نام گروه", callback_data=f"dx_grename_{gid}"), Button("🗑 حذف گروه", callback_data=f"dx_gdelq_{gid}")], back("dx_groups")]
-    await show(update, "\n".join(lines), keyboard)
+    if details:
+        permitted = await zones_for(core, uid)
+        part,p = page_slice(mm,page)
+        semaphore = asyncio.Semaphore(4)
+        async def fetch(m):
+            if m['zone_id'] not in permitted: return None
+            async with semaphore:
+                try: return await asyncio.to_thread(cf.get_record_details_strict,m['zone_id'],m['record_id'])
+                except Exception as exc: return exc
+        results = await asyncio.gather(*(fetch(m) for m in part))
+        for m,r in zip(part,results):
+            if r is None:
+                lines.append('🔒 عضو خارج از دسترسی فعلی'); continue
+            if isinstance(r,Exception):
+                lines.append('⚠️ دریافت عضو ناموفق؛ رکورد حذف‌شده یا خطای ارتباطی')
+                label = 'عضو دریافت‌نشده'
+            else:
+                lines.append(f"• {txt(r['name'],45)} [{r['type']}] → {txt(r.get('content',''),40)}")
+                label = txt(r['name'],32)
+            keyboard.append([Button('➖ '+label,callback_data=f"dx_rm_{gid}_{m['record_id']}")])
+        keyboard += pager(p,len(mm),f"dx_gp_{gid}_") + [back(f"dx_g_{gid}")]
+    else:
+        if not mm: lines.append('برای شروع، «انتخاب اعضا» را بزنید.')
+        keyboard = [
+            [Button('📋 مشاهده اعضا',callback_data=f'dx_gp_{gid}_0'), Button('➕ انتخاب اعضا',callback_data=f'dx_addz_{gid}_0')],
+            [Button('✏️ ویرایش گروهی',callback_data=f'dx_ge_{gid}'), Button(f'🧬 کلون‌ها ({len(clones)})',callback_data=f'dx_cm_{gid}')],
+            [Button('🖊 تغییر نام',callback_data=f'dx_grename_{gid}'), Button('🗑 حذف گروه',callback_data=f'dx_gdelq_{gid}')],
+            back('dx_groups')]
+    await show(update,'\n'.join(lines),keyboard)
 
 
 async def add_zone_menu(update, core, uid, gid, page):
     if not group(uid, gid): return
-    zones = list(zones_for(core, uid).values())
+    zones = list((await zones_for(core, uid)).values())
     items,p = page_slice(zones, page)
     keyboard = compact_rows([row[0] for row in [[Button(txt(z["name"], 42), callback_data=f"dx_addr_{gid}_{z['id']}_0")] for z in items]])
     keyboard += pager(p,len(zones),f"dx_addz_{gid}_") + [back(f"dx_g_{gid}")]
@@ -218,7 +247,7 @@ async def add_zone_menu(update, core, uid, gid, page):
 
 
 async def add_record_menu(update, core, uid, gid, zone_id, page):
-    if not group(uid,gid) or not allowed(core,uid,zone_id):
+    if not group(uid,gid) or not await allowed(core,uid,zone_id):
         await show(update,"دسترسی به این دامنه ندارید.",[back("dx_groups")]);return
     try:
         rr = [r for r in await asyncio.to_thread(cf.get_dns_records_fresh, zone_id) if r.get("type") in GROUP_TYPES]
@@ -226,12 +255,12 @@ async def add_record_menu(update, core, uid, gid, zone_id, page):
         await show(update, f"خطا در دریافت رکوردها: {txt(e,120)}", [back(f"dx_addz_{gid}_0")]); return
     part,p = page_slice(rr,page)
     # The zone is retained per-user, preventing need for oversized Telegram callbacks.
-    FEATURE_INPUT[uid] = {"zone_pick":zone_id,"group_pick":gid}
+    FEATURE_INPUT[uid] = {"zone_pick":zone_id,"group_pick":gid,"group_page":p}
     exists = {(x['zone_id'],x['record_id']) for x in members(gid)}
     keyboard = [[Button(("✅ " if (zone_id,r['id']) in exists else "➕ ")+f"{txt(r['name'],26)} | {r['type']}",
                         callback_data=f"dx_join_{gid}_{r['id']}")] for r in part]
     keyboard += pager(p,len(rr),f"dx_addr_{gid}_{zone_id}_") + [back(f"dx_addz_{gid}_0")]
-    await show(update,"ساب‌دامنه را برای افزودن به گروه انتخاب کنید:",keyboard)
+    await show(update,"اعضا را انتخاب کنید: ➕ افزودن، ✅ برداشتن از گروه. پس از انتخاب‌ها بازگردید.",keyboard)
 
 
 async def group_edit_menu(update, core, uid, gid):
@@ -277,7 +306,7 @@ def valid_value(field, value, records):
 
 async def begin_preview(update, core, uid, pairs, field, value, *, gid=None, source="bulk"):
     """Build an immutable confirmation preview with live snapshots."""
-    permitted = zones_for(core, uid)
+    permitted = await zones_for(core, uid)
     if len(pairs) > 200:
         await show(update,"حداکثر ۲۰۰ رکورد در هر عملیات مجاز است.",[back("dx_groups" if gid else "dx_bulk")]);return
     records = []
@@ -314,7 +343,7 @@ async def execute(update, core, uid, token):
         await show(update,"اعضای گروه پس از پیش‌نمایش تغییر کرده‌اند؛ دوباره تأیید کنید.",[back(f"dx_g_{gid}")]);return
     # Recheck every live record before *any* mutation, to reduce partial apply.
     try:
-        zones=zones_for(core,uid)
+        zones=await zones_for(core,uid)
         for zid,r in plan['items']:
             if zid not in zones: raise ValueError("دسترسی دامنه تغییر کرده است")
             live=await asyncio.to_thread(cf.get_record_details_strict,zid,r['id'])
@@ -346,7 +375,7 @@ async def execute(update, core, uid, token):
 
 async def bulk_menu(update, core, uid, page=0):
     selected=BULK_SELECTION.setdefault(uid,set())
-    zones=list(zones_for(core,uid).values())
+    zones=list((await zones_for(core,uid)).values())
     items,p=page_slice(zones,page)
     kb= compact_rows([row[0] for row in [[Button(txt(z['name'],43),callback_data=f"dx_bz_{z['id']}_0")] for z in items]])
     kb+=pager(p,len(zones),"dx_bulk_")
@@ -356,7 +385,7 @@ async def bulk_menu(update, core, uid, page=0):
 
 
 async def bulk_records(update, core, uid, zid, page):
-    if not allowed(core,uid,zid): return
+    if not await allowed(core,uid,zid): return
     try:
         records=[r for r in await asyncio.to_thread(cf.get_dns_records_fresh,zid) if r['type'] in ('A','AAAA')]
     except Exception as e:
@@ -379,7 +408,7 @@ async def search_menu(update):
 
 async def search_records(update, core, uid, field, term):
     found=[]; failures=[]
-    zones=list(zones_for(core,uid).items())
+    zones=list((await zones_for(core,uid)).items())
     semaphore=asyncio.Semaphore(5)
 
     async def fetch(zid):
@@ -413,7 +442,7 @@ async def search_results(update,uid,page,notice=""):
 
 
 async def history_menu(update,core,uid,page):
-    zones=zones_for(core,uid)
+    zones=await zones_for(core,uid)
     if not zones:
         rows=[]
     else:
@@ -434,7 +463,7 @@ async def history_menu(update,core,uid,page):
 
 
 async def monitors_menu(update,core,uid,page=0):
-    zones=zones_for(core,uid)
+    zones=await zones_for(core,uid)
     with db() as c:
         rows=c.execute("SELECT * FROM dns_monitors WHERE owner=? ORDER BY zone_id,record_id",(uid,)).fetchall()
     visible=[m for m in rows if m['zone_id'] in zones]
@@ -456,14 +485,14 @@ async def monitors_menu(update,core,uid,page=0):
 
 
 async def monitor_zones(update,core,uid,page):
-    zones=list(zones_for(core,uid).values());part,p=page_slice(zones,page)
+    zones=list((await zones_for(core,uid)).values());part,p=page_slice(zones,page)
     kb= compact_rows([row[0] for row in [[Button(txt(z['name']),callback_data=f"dx_mr_{z['id']}_0")] for z in part]])
     kb+=pager(p,len(zones),"dx_mz_")+[back("dx_monitor")]
     await show(update,"دامنه مانیتور را انتخاب کنید:",kb)
 
 
 async def monitor_records(update,core,uid,zid,page):
-    if not allowed(core,uid,zid):return
+    if not await allowed(core,uid,zid):return
     try:records=[r for r in await asyncio.to_thread(cf.get_dns_records_fresh,zid) if r['type'] in ('A','AAAA')]
     except Exception as e:
         await show(update,f"خطا: {txt(e,150)}",[back("dx_monitor")]);return
@@ -511,7 +540,17 @@ async def check_monitor(m):
     return True,"DNS و TCP پاسخ‌گو هستند"
 
 
+_MONITOR_LOCK = asyncio.Lock()
+
+
 async def monitor_job(context,core,owner_filter=None):
+    # A manual check and the repeating job must not count the same cycle twice.
+    if _MONITOR_LOCK.locked():return
+    async with _MONITOR_LOCK:
+        await _monitor_job(context,core,owner_filter)
+
+
+async def _monitor_job(context,core,owner_filter=None):
     with db() as c:
         if owner_filter is None:
             entries=c.execute("SELECT * FROM dns_monitors WHERE enabled=1").fetchall()
@@ -525,7 +564,7 @@ async def monitor_job(context,core,owner_filter=None):
         try:
             if core.is_user_blocked(uid) or not core.is_user_authorized(uid):return
             if uid not in access_cache:
-                access_cache[uid]=set(zones_for(core,uid))
+                access_cache[uid]=set(await zones_for(core,uid))
             if m['zone_id'] not in access_cache[uid]:return
             async with semaphore:
                 ok,reason=await check_monitor(m)
@@ -618,7 +657,7 @@ async def handle_message(update,context,core):
             port=int(text)
             if not (1<=port<=65535):raise ValueError()
             zid,rid=state['zone_id'],state['record_id']
-            if not allowed(core,uid,zid):raise ValueError()
+            if not await allowed(core,uid,zid):raise ValueError()
             record=await asyncio.to_thread(cf.get_record_details_strict,zid,rid)
             if record['type'] not in ('A','AAAA'):raise ValueError()
             with db() as c:
@@ -645,6 +684,8 @@ async def handle_callback(update,context,core):
     if await group_clones.callback(update,context,core,sys.modules[__name__]):
         return True
     group_clones.PLANS.pop(uid,None)
+    if not data.startswith('dx_apply_'):
+        PENDING.pop(uid, None)
     try:
         if data=='dx_groups' or data.startswith('dx_groups_'):
             await groups_menu(update,core,uid,int(data[len('dx_groups_'):]) if data!='dx_groups' else 0)
@@ -654,7 +695,7 @@ async def handle_callback(update,context,core):
         elif data.startswith('dx_g_'):
             await group_menu(update,core,uid,data[5:])
         elif data.startswith('dx_gp_'):
-            _,_,gid,p=data.split('_');await group_menu(update,core,uid,gid,int(p))
+            _,_,gid,p=data.split('_');await group_menu(update,core,uid,gid,int(p),details=True)
         elif data.startswith('dx_addz_'):
             _,_,gid,p=data.split('_');await add_zone_menu(update,core,uid,gid,int(p))
         elif data.startswith('dx_addr_'):
@@ -663,13 +704,17 @@ async def handle_callback(update,context,core):
             _,_,gid,rid=data.split('_')
             prev=FEATURE_INPUT.get(uid,{})
             zid=prev.get('zone_pick')
-            if not zid or prev.get('group_pick')!=gid or not group(uid,gid) or not allowed(core,uid,zid):
+            if not zid or prev.get('group_pick')!=gid or not group(uid,gid) or not await allowed(core,uid,zid):
                 raise ValueError("انتخاب رکورد منقضی شد؛ مجدداً دامنه را باز کنید.")
             r=await asyncio.to_thread(cf.get_record_details_strict,zid,rid)
             if r['type'] not in GROUP_TYPES:raise ValueError("نوع رکورد پشتیبانی نمی‌شود")
             with db() as c:
-                c.execute("INSERT OR IGNORE INTO dns_group_members(group_id,zone_id,record_id) VALUES(?,?,?)",(gid,zid,rid))
-            await group_menu(update,core,uid,gid)
+                exists = c.execute("SELECT 1 FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?", (gid,zid,rid)).fetchone()
+                if exists:
+                    c.execute("DELETE FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?", (gid,zid,rid))
+                else:
+                    c.execute("INSERT INTO dns_group_members(group_id,zone_id,record_id) VALUES(?,?,?)",(gid,zid,rid))
+            await add_record_menu(update,core,uid,gid,zid,prev.get('group_page',0))
         elif data.startswith('dx_rm_'):
             _,_,gid,rid=data.split('_')
             if not group(uid,gid):raise ValueError("گروه نامعتبر")
@@ -678,7 +723,7 @@ async def handle_callback(update,context,core):
                 # Never delete two zone memberships due to an ID collision.
                 if len(hits)!=1:raise ValueError("عضو یکتا نبود؛ فهرست را تازه‌سازی کنید")
                 c.execute("DELETE FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?",(gid,hits[0]['zone_id'],rid))
-            await group_menu(update,core,uid,gid)
+            await group_menu(update,core,uid,gid,details=True)
         elif data.startswith('dx_grename_'):
             gid=data.split('_')[-1]
             if not group(uid,gid):raise ValueError("گروه پیدا نشد")
@@ -732,7 +777,7 @@ async def handle_callback(update,context,core):
         elif data.startswith('dx_bs_'):
             rid=data.split('_')[-1];v=FEATURE_INPUT.get(uid,{})
             zid=v.get('bulk_zone')
-            if not zid or not allowed(core,uid,zid):raise ValueError("دامنه معتبر نیست")
+            if not zid or not await allowed(core,uid,zid):raise ValueError("دامنه معتبر نیست")
             r=await asyncio.to_thread(cf.get_record_details_strict,zid,rid)
             if r['type'] not in ('A','AAAA'):raise ValueError("فقط رکوردهای IP")
             selected=BULK_SELECTION.setdefault(uid,set());pair=(zid,rid)
@@ -756,7 +801,7 @@ async def handle_callback(update,context,core):
             await search_results(update,uid,int(data[6:]))
         elif data.startswith('dx_sd_'):
             i=int(data[6:]);r=SEARCH_CACHE.get(uid,[])[i]
-            if not allowed(core,uid,r['zone_id']):raise ValueError("دسترسی ندارید")
+            if not await allowed(core,uid,r['zone_id']):raise ValueError("دسترسی ندارید")
             await asyncio.to_thread(cf.get_record_details_strict,r['zone_id'],r['record_id'])
             z=await asyncio.to_thread(cf.get_zone_info_by_id,r['zone_id'])
             core.user_state.setdefault(uid,{}).update({"zone_id":r['zone_id'],"zone_name":z['name'] if z else "", "record_id":r['record_id']})
@@ -774,7 +819,7 @@ async def handle_callback(update,context,core):
             _,_,zid,p=data.split('_');await monitor_records(update,core,uid,zid,int(p))
         elif data.startswith('dx_madd_'):
             rid=data.split('_')[-1];zid=FEATURE_INPUT.get(uid,{}).get('monitor_zone')
-            if not zid or not allowed(core,uid,zid):raise ValueError("دامنه انتخاب نشده")
+            if not zid or not await allowed(core,uid,zid):raise ValueError("دامنه انتخاب نشده")
             FEATURE_INPUT[uid]={"mode":"monitor_port","zone_id":zid,"record_id":rid}
             await show(update,"پورت TCP مقصد را بفرستید (مثلاً 443 یا 80):",[back("dx_monitor")])
         elif data.startswith('dx_mdel_'):

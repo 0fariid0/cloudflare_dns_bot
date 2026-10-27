@@ -27,7 +27,10 @@ async def render(update, text, keyboard):
         try:
             return await update.effective_message.edit_text(text, reply_markup=markup)
         except BadRequest as exc:
-            if 'message is not modified' not in str(exc).lower():
-                raise
+            error=str(exc).lower()
+            if 'message is not modified' in error:return
+            if any(reason in error for reason in ('message to edit not found', "message can't be edited")):
+                return await update.effective_message.reply_text(text,reply_markup=markup)
+            raise
     else:
         return await update.effective_message.reply_text(text, reply_markup=markup)
