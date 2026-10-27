@@ -732,16 +732,13 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = get_last_error()
     with dns_adv.db() as c:
         groups = c.execute("SELECT id,name FROM dns_groups WHERE owner=? ORDER BY name", (uid,)).fetchall()
-    with dns_adv.db() as c:
-        clone_count = c.execute("SELECT COUNT(*) FROM dns_group_clones WHERE owner=?",(uid,)).fetchone()[0]
     keyboard = [
         [InlineKeyboardButton(f"🌐 دامنه‌ها ({len(zones)})",callback_data='ui_domains'), InlineKeyboardButton(f"📁 گروه‌ها ({len(groups)})",callback_data='dx_groups')],
-        [InlineKeyboardButton(f"🧬 مرکز کلون‌ها ({clone_count})",callback_data='dx_clones')],
         [InlineKeyboardButton('🔁 تغییر گروهی',callback_data='dx_bulk'),InlineKeyboardButton('🔎 جست‌وجوی DNS',callback_data='dx_search')],
         [InlineKeyboardButton('📡 مانیتورینگ',callback_data='dx_monitor'),InlineKeyboardButton('📜 تاریخچه تغییرات',callback_data='dx_history')],
         [InlineKeyboardButton('🔄 تازه‌سازی',callback_data='refresh_domains'),InlineKeyboardButton('ℹ️ راهنما',callback_data='show_help')]]
     if uid==ADMIN_ID:keyboard.append([InlineKeyboardButton('⚙️ مدیریت کاربران و ربات',callback_data='ui_admin')])
-    text='🏠 مدیریت DNS\nبخش موردنظر را انتخاب کنید.\nکلون‌ها و گروه‌ها هرکدام بخش جداگانه دارند.'
+    text='🏠 مدیریت DNS\nبخش موردنظر را انتخاب کنید.\n'
     if error:text+=f"\n⚠️ دریافت دامنه‌ها ناموفق بود: {str(error)[:300]}"
     await render(update,text,keyboard)
 
@@ -1084,8 +1081,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = ("ℹ️ راهنمای مدیریت DNS\n\n"
         "🌐 دامنه‌ها: مشاهده، ایجاد و ویرایش رکوردها.\n"
         "📁 گروه‌ها: انتخاب چند رکورد از دامنه‌های مختلف و ویرایش یکجای آن‌ها.\n"
-        "🧬 مرکز کلون‌ها: تمام کلون‌های ثبت‌شده بر اساس گروه یا IP؛ مشاهده، ویرایش و حذف با تأیید.\n"
-        "🔎 کلون‌های قدیمی: شناسایی رکوردهای هم‌نام؛ نتیجه اسکن به‌تنهایی اثبات کلون بودن نیست.\n"
+        "IPهای گروه: هر IP یک ردیف دارد؛ ✏️ تغییر مقدار و 🗑 حذف با تأیید.\n"
         "🔁 تغییر گروهی: انتخاب آزاد رکوردها و تغییر IP با پیش‌نمایش.\n"
         "📡 مانیتورینگ: بررسی DNS و پورت مقصد و ارسال هشدار؛ بدون تغییر DNS.\n"
         "🤖 اتصال هوشمند: از تنظیمات رکورد A بدون پروکسی، برای جایگزینی خودکار IP.\n\n"

@@ -192,40 +192,18 @@ async def groups_menu(update, core, uid, page=0):
             (SELECT COUNT(*) FROM dns_group_clones cl WHERE cl.group_id=g.id AND cl.owner=g.owner) clone_count
             FROM dns_groups g WHERE owner=? ORDER BY name""", (uid,)).fetchall()
     items,p = page_slice(rows,page)
-    keyboard = compact_rows([row[0] for row in [[Button(f"📁 {txt(row['name'], 25)} · {row['member_count']} عضو / {row['clone_count']} کلون", callback_data=f"dx_g_{row['id']}")] for row in items]])
+    keyboard = [[Button(f"📁 {txt(row['name'],35)}",callback_data=f"dx_g_{row['id']}"),
+                 Button('✏️',callback_data=f"dx_grename_{row['id']}"),
+                 Button('🗑',callback_data=f"dx_gdelq_{row['id']}")] for row in items]
     keyboard += pager(p,len(rows),"dx_groups_")
-    keyboard += [[Button("➕ ساخت گروه", callback_data="dx_gnew"), Button("🧬 همه کلون‌ها", callback_data="dx_clones")], back("back_to_main")]
+    keyboard += [[Button("➕ ساخت گروه", callback_data="dx_gnew")], back("back_to_main")]
     await show(update, f"📁 گروه‌های DNS ({len(rows)})\nبا انتخاب گروه، رکوردهای عضو و تنظیمات گروهی را مدیریت کنید.", keyboard)
 
 
 async def group_menu(update, core, uid, gid, page=0, *, details=False):
-    if not details:
-        return await group_records.dashboard(update,core,sys.modules[__name__],uid,gid,page)
-    g = group(uid, gid)
-    if not g:
-        await show(update, "گروه پیدا نشد یا مجاز نیست.", [back("dx_groups")]); return
-    mm = members(gid)
-    clones = group_clones.rows(sys.modules[__name__], uid, gid)
-    lines = [f"📁 {g['name']}", f"📋 {len(mm)} عضو اصلی • 🧬 {len(clones)} کلون",
-             "ویرایش گروه فقط روی اعضای اصلی اعمال می‌شود."]
-    keyboard = []
-    permitted = await zones_for(core, uid)
-    part,p = page_slice(mm,page)
-    semaphore = asyncio.Semaphore(4)
-    async def fetch(m):
-        if m['zone_id'] not in permitted: return None
-        async with semaphore:
-            try: return await asyncio.to_thread(cf.get_record_details_strict,m['zone_id'],m['record_id'])
-            except Exception as exc: return exc
-    results = await asyncio.gather(*(fetch(m) for m in part))
-    for m,r in zip(part,results):
-        if r is None:
-            lines.append('🔒 عضو خارج از دسترسی فعلی'); continue
-        if isinstance(r,Exception):
-            lines.append('⚠️ دریافت عضو ناموفق؛ رکورد حذف‌شده یا خطای ارتباطی')
-            label = 'عضو دریافت‌نشده'
-
-    await show(update,'\n'.join(lines),keyboard)
+    if details:
+        return await group_records.members_menu(update,core,sys.modules[__name__],uid,gid,page)
+    return await group_records.dashboard(update,core,sys.modules[__name__],uid,gid,page)
 
 
 async def add_zone_menu(update, core, uid, gid, page):
@@ -247,11 +225,11 @@ async def add_record_menu(update, core, uid, gid, zone_id, page):
     part,p = page_slice(rr,page)
     # The zone is retained per-user, preventing need for oversized Telegram callbacks.
     FEATURE_INPUT[uid] = {"zone_pick":zone_id,"group_pick":gid,"group_page":p}
-    exists = {(x['zone_id'],x['record_id']) for x in members(gid)}
+    exists = group_records.selected_pairs(sys.modules[__name__],uid,gid)
     keyboard = [[Button(("✅ " if (zone_id,r['id']) in exists else "➕ ")+f"{txt(r['name'],26)} | {r['type']}",
                         callback_data=f"dx_join_{gid}_{r['id']}")] for r in part]
     keyboard += pager(p,len(rr),f"dx_addr_{gid}_{zone_id}_") + [back(f"dx_addz_{gid}_0")]
-    await show(update,"اعضا را انتخاب کنید: ➕ افزودن، ✅ برداشتن از گروه. پس از انتخاب‌ها بازگردید.",keyboard)
+    await show(update,"اعضا را انتخاب کنید: ➕ افزودن؛ ✅ مشاهدهٔ تأیید برداشتن از گروه.",keyboard)
 
 
 async def group_edit_menu(update, core, uid, gid):
@@ -327,6 +305,8 @@ async def execute(update, core, uid, token):
     plan = PENDING.pop(uid,None)
     if not plan or plan['token'] != token or time.monotonic()-plan['at']>600:
         await show(update,"⏰ پیش‌نمایش منقضی شده است؛ دوباره انتخاب کنید.",[back("back_to_main")]);return
+    if plan.get('kind')=='group_members':
+        return await group_records.execute_remove(update,core,sys.modules[__name__],uid,plan)
     if plan.get('kind')=='group_records':
         return await group_records.execute(update,core,sys.modules[__name__],uid,plan)
     gid=plan['gid']
@@ -606,7 +586,7 @@ async def handle_message(update,context,core):
             await group_clones.preview_create(update,core,sys.modules[__name__],uid,state['gid'],text)
         except Exception as exc:
             FEATURE_INPUT[uid]=state
-            await show(update,'❌ '+txt(exc,300),[back(f"dx_cm_{state['gid']}")])
+            await show(update,'❌ '+txt(exc,300),[back(f"dx_g_{state['gid']}")])
         return True
     if mode in ('group_new','group_rename'):
         if not text or len(text)>48 or any(ord(c)<32 for c in text):
@@ -710,22 +690,21 @@ async def handle_callback(update,context,core):
                 raise ValueError("انتخاب رکورد منقضی شد؛ مجدداً دامنه را باز کنید.")
             r=await asyncio.to_thread(cf.get_record_details_strict,zid,rid)
             if r['type'] not in GROUP_TYPES:raise ValueError("نوع رکورد پشتیبانی نمی‌شود")
-            with db() as c:
-                exists = c.execute("SELECT 1 FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?", (gid,zid,rid)).fetchone()
-                if exists:
-                    c.execute("DELETE FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?", (gid,zid,rid))
-                else:
+            if (zid,rid) in group_records.selected_pairs(sys.modules[__name__],uid,gid):
+                entries=await group_records.member_entries(core,sys.modules[__name__],uid,gid)
+                entry=next((e for e in entries if (zid,rid) in e['pairs']),None)
+                if not entry:raise ValueError('عضو پیدا نشد؛ دوباره انتخاب کنید.')
+                await group_records.preview_remove(update,core,sys.modules[__name__],uid,gid,entry)
+            else:
+                with db() as c:
                     c.execute("INSERT INTO dns_group_members(group_id,zone_id,record_id) VALUES(?,?,?)",(gid,zid,rid))
-            await add_record_menu(update,core,uid,gid,zid,prev.get('group_page',0))
+                await add_record_menu(update,core,uid,gid,zid,prev.get('group_page',0))
         elif data.startswith('dx_rm_'):
             _,_,gid,rid=data.split('_')
-            if not group(uid,gid):raise ValueError("گروه نامعتبر")
-            with db() as c:
-                hits=c.execute("SELECT zone_id FROM dns_group_members WHERE group_id=? AND record_id=?",(gid,rid)).fetchall()
-                # Never delete two zone memberships due to an ID collision.
-                if len(hits)!=1:raise ValueError("عضو یکتا نبود؛ فهرست را تازه‌سازی کنید")
-                c.execute("DELETE FROM dns_group_members WHERE group_id=? AND zone_id=? AND record_id=?",(gid,hits[0]['zone_id'],rid))
-            await group_menu(update,core,uid,gid,details=True)
+            entries=await group_records.member_entries(core,sys.modules[__name__],uid,gid)
+            hits=[e for e in entries if any(r==rid for _,r in e['pairs'])]
+            if len(hits)!=1:raise ValueError('عضو یکتا نبود؛ فهرست را تازه کنید.')
+            await group_records.preview_remove(update,core,sys.modules[__name__],uid,gid,hits[0])
         elif data.startswith('dx_grename_'):
             gid=data.split('_')[-1]
             if not group(uid,gid):raise ValueError("گروه پیدا نشد")
@@ -738,9 +717,11 @@ async def handle_callback(update,context,core):
                        [[Button("🗑️ تأیید حذف گروه",callback_data=f"dx_gdel_{gid}")],back(f"dx_g_{gid}")])
         elif data.startswith('dx_gdel_'):
             gid=data.split('_')[-1]
-            if group_clones.rows(sys.modules[__name__],uid,gid) or (uid,gid) in group_clones.BUSY:
-                raise ValueError('ابتدا کلون‌های گروه را از بخش کلون‌ها حذف کنید؛ سپس خود گروه را حذف کنید.')
-            with db() as c:c.execute("DELETE FROM dns_groups WHERE owner=? AND id=?",(uid,gid))
+            if not group(uid,gid):raise ValueError('گروه پیدا نشد.')
+            if (uid,gid) in group_clones.BUSY:raise ValueError('عملیات در حال اجراست؛ کمی صبر کنید.')
+            with db() as c:
+                c.execute('DELETE FROM dns_group_clones WHERE owner=? AND group_id=?',(uid,gid))
+                c.execute('DELETE FROM dns_groups WHERE owner=? AND id=?',(uid,gid))
             await groups_menu(update,core,uid)
         elif data.startswith('dx_ge_'):
             await group_edit_menu(update,core,uid,data[6:])

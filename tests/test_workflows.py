@@ -79,7 +79,8 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
             pp.start();self.file_patchers.append(pp)
         bot._DATA_CACHE.clear();bot.user_state.clear()
         adv.FEATURE_INPUT.clear();adv.PENDING.clear();adv.SEARCH_CACHE.clear();adv.BULK_SELECTION.clear()
-        clones.PLANS.clear();clones.BUSY.clear();clones.DISCOVERIES.clear()
+        clones.PLANS.clear();clones.BUSY.clear()
+        adv.group_records.MEMBER_VIEWS.clear()
         adv.group_records.VIEWS.clear()
         cf._invalidate_zones_cache();cf._invalidate_records_cache();cf._set_last_error(None)
         bot.load_users()
@@ -230,7 +231,8 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):await clones.preview_delete(Update(),bot,adv,2,G,rr[0]['id'])
         with self.assertRaises(ValueError):await clones.preview_create(Update(),bot,adv,2,G,'4.4.4.4')
         update=await self.click('dx_clones',2)
-        self.assertIn('0 رکورد',update.message.text)
+        self.assertNotIn('node.example.com',update.message.text)
+        self.assertNotIn('مرکز کلون',update.message.text)
 
     async def test_all_clone_menu_routes_and_callback_limits(self):
         rr=await self.create()
@@ -242,14 +244,17 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
             with self.subTest(route=route):
                 update=await self.click(route)
                 self.assertTrue(update.message.frames)
-        self.assertTrue(bot.user_state[1].get('record_back'))
+        self.assertNotIn('مرکز کلون',update.message.text)
 
-    async def test_membership_multi_select_preserves_page_and_toggles(self):
+    async def test_membership_removal_requires_confirmation_and_can_be_readded(self):
         await self.click(f'dx_addr_{G}_{Z}_0')
-        self.assertEqual(adv.FEATURE_INPUT[1]['zone_pick'],Z)
         await self.click(f'dx_join_{G}_{R}')
+        self.assertEqual(len(adv.members(G)),1)
+        self.assertIn(1,adv.PENDING)
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
         self.assertEqual(len(adv.members(G)),0)
-        self.assertEqual(adv.FEATURE_INPUT[1]['zone_pick'],Z)
+        self.assertIn((Z,R),self.records)
+        await self.click(f'dx_addr_{G}_{Z}_0')
         await self.click(f'dx_join_{G}_{R}')
         self.assertEqual(len(adv.members(G)),1)
 
@@ -264,20 +269,24 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         self.assertIn(1,clones.PLANS)
         await self.click('dx_capply_'+clones.PLANS[1][0])
         self.assertEqual(len(clones.rows(adv,1,state['gid'])),1)
-        hub=await self.click('dx_clones')
-        self.assertIn('1 رکورد',hub.message.text)
+        group=await self.click('dx_g_'+state['gid'])
+        labels=[b.text for row in group.message.frames[-1][1] for b in row]
+        self.assertIn('4.4.4.4',labels)
+        self.assertNotIn('مرکز کلون',group.message.text)
 
-    async def test_delete_group_with_clones_is_blocked(self):
+    async def test_delete_group_preserves_all_dns_records(self):
         await self.create()
         await self.click('dx_gdel_'+G)
-        self.assertIsNotNone(adv.group(1,G))
+        self.assertIsNone(adv.group(1,G))
         self.assertEqual(len(self.records),3)
-
-    async def test_legacy_scan_is_read_only_and_includes_untracked_records(self):
-        self.records[(Z,'e'*32)]=dict(self.records[(Z,R)],id='e'*32,content='2.2.2.2')
-        await self.click('dx_legacy')
-        self.assertEqual(len(clones.DISCOVERIES[1]),2)
         self.assertEqual(len(clones.rows(adv,1,G)),0)
+
+    async def test_removed_clone_center_routes_redirect_without_writing(self):
+        self.records[(Z,'e'*32)]=dict(self.records[(Z,R)],id='e'*32,content='2.2.2.2')
+        for route in ('dx_clones','dx_legacy','dx_chip_0','dx_chg_0'):
+            update=await self.click(route)
+            self.assertNotIn('مرکز کلون',update.message.text)
+            self.assertNotIn('همه کلون',update.message.text)
         self.assertEqual(self.writes,[])
 
     async def test_ipv6_clone_and_bad_inputs(self):
@@ -315,23 +324,25 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         for n in range(25):
             with adv.db() as c:c.execute('INSERT INTO dns_groups VALUES(?,?,?,?)',(f'{n:012x}',1,f'گروه {n:02}',adv.stamp()))
         update=await self.click('dx_groups_1')
-        self.assertLessEqual(len(update.message.frames[-1][1]),9)
+        self.assertLessEqual(len(update.message.frames[-1][1]),13)
         with patch.object(cf,'get_record_details_strict',side_effect=AssertionError('Summary should not fetch records')):
             await self.click('dx_g_'+G)
 
     async def test_group_page_shows_live_original_and_clone_ips_with_actions(self):
         await self.create('2.2.2.2')
         update=await self.click('dx_g_'+G)
-        self.assertIn('1.1.1.1',update.message.text)
-        self.assertIn('2.2.2.2',update.message.text)
+        labels=[b.text for row in update.message.frames[-1][1] for b in row]
+        self.assertIn('1.1.1.1',labels)
+        self.assertIn('2.2.2.2',labels)
         buttons=[b for row in update.message.frames[-1][1] for b in row]
         self.assertTrue(any(b.callback_data=='dx_cnew_'+G for b in buttons))
         self.assertEqual(sum(b.callback_data.startswith('dx_be_') for b in buttons),2)
         self.assertEqual(sum(b.callback_data.startswith('dx_bd_') for b in buttons),2)
         self.records[(Z,R)]['content']='9.9.9.9'
         update=await self.click('dx_g_'+G)
-        self.assertIn('9.9.9.9',update.message.text)
-        self.assertNotIn('1.1.1.1',update.message.text)
+        labels=[b.text for row in update.message.frames[-1][1] for b in row]
+        self.assertIn('9.9.9.9',labels)
+        self.assertNotIn('1.1.1.1',labels)
 
     async def test_group_page_edits_only_selected_original_ip_bucket(self):
         await self.create('2.2.2.2')
@@ -340,7 +351,7 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         with adv.db() as c:c.execute('INSERT INTO dns_group_members VALUES(?,?,?)',(G,Z,second))
         await self.click('dx_g_'+G)
         view=adv.group_records.VIEWS[1]
-        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='original')
+        index=next(i for i,b in enumerate(view['buckets']) if b[2]=='1.1.1.1')
         await self.click(f'dx_be_{view["token"]}_{index}')
         await bot.handle_message(Update(text='8.8.8.8'),self.context)
         self.assertEqual(self.records[(Z,R)]['content'],'1.1.1.1')
@@ -354,21 +365,22 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         rr=await self.create('2.2.2.2')
         await self.click('dx_g_'+G)
         view=adv.group_records.VIEWS[1]
-        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone')
+        index=next(i for i,b in enumerate(view['buckets']) if b[2]=='2.2.2.2')
         await self.click(f'dx_be_{view["token"]}_{index}')
         await bot.handle_message(Update(text='7.7.7.7'),self.context)
         await self.click('dx_apply_'+adv.PENDING[1]['token'])
         self.assertEqual(self.records[(Z,R)]['content'],'1.1.1.1')
         self.assertEqual(clones.rows(adv,1,G)[0]['ip'],'7.7.7.7')
         update=await self.click('dx_g_'+G)
-        self.assertIn('7.7.7.7',update.message.text)
-        self.assertNotIn('2.2.2.2',update.message.text)
+        labels=[b.text for row in update.message.frames[-1][1] for b in row]
+        self.assertIn('7.7.7.7',labels)
+        self.assertNotIn('2.2.2.2',labels)
 
     async def test_group_page_deletes_original_but_preserves_clones(self):
         await self.create('2.2.2.2')
         await self.click('dx_g_'+G)
         view=adv.group_records.VIEWS[1]
-        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='original')
+        index=next(i for i,b in enumerate(view['buckets']) if b[2]=='1.1.1.1')
         update=await self.click(f'dx_bd_{view["token"]}_{index}')
         self.assertIn('از Cloudflare حذف',update.message.text)
         self.assertIn((Z,R),self.records)
@@ -400,7 +412,7 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         await self.create('2.2.2.2')
         await self.click('dx_g_'+G)
         view=adv.group_records.VIEWS[1]
-        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone')
+        index=next(i for i,b in enumerate(view['buckets']) if b[2]=='2.2.2.2')
         await self.click(f'dx_bd_{view["token"]}_{index}')
         token=adv.PENDING[1]['token']
         row=clones.rows(adv,1,G)[0]
@@ -436,12 +448,99 @@ class Workflows(unittest.IsolatedAsyncioTestCase):
         await self.create()
         await self.click('dx_g_'+G)
         view=adv.group_records.VIEWS[1]
-        index=next(i for i,b in enumerate(view['buckets']) if b[0]=='clone' and b[2]=='2.2.2.2')
+        index=next(i for i,b in enumerate(view['buckets']) if b[2]=='2.2.2.2')
         await self.click(f'dx_bd_{view["token"]}_{index}')
         await self.click('dx_apply_'+adv.PENDING[1]['token'])
         self.assertIn((Z,R),self.records)
         self.assertEqual(len(self.records),2)
         self.assertEqual(clones.rows(adv,1,G)[0]['ip'],'3.3.3.3')
+
+    async def test_compact_ip_rows_have_three_buttons_and_only_required_controls(self):
+        await self.create('2.2.2.2')
+        update=await self.click('dx_g_'+G)
+        rows=update.message.frames[-1][1]
+        ip_rows=[row for row in rows if any(b.callback_data.startswith('dx_be_') for b in row)]
+        self.assertEqual(len(ip_rows),2)
+        for row in ip_rows:
+            self.assertEqual(len(row),3)
+            self.assertEqual([b.text for b in row[1:]],['✏️','🗑'])
+        labels=[b.text for row in rows for b in row]
+        for removed in ('اصلی','مدیریت کلون','تنظیمات گروه','اعضای اصلی','انتخاب اعضا'):
+            self.assertFalse(any(removed in label for label in labels))
+        self.assertTrue(any('کنترل اعضا' in label for label in labels))
+        for route in ('back_to_main','dx_groups'):
+            update=await self.click(route)
+            self.assertFalse(any('کلون' in b.text for row in update.message.frames[-1][1] for b in row))
+
+    async def test_same_ip_is_one_row_even_if_one_record_was_copied(self):
+        row=(await self.create('2.2.2.2'))[0]
+        cf.patch_dns_fields(Z,row['record_id'],{'content':'1.1.1.1'})
+        await self.click('dx_g_'+G)
+        buckets=adv.group_records.VIEWS[1]['buckets']
+        self.assertEqual(len(buckets),1)
+        self.assertEqual(len(buckets[0][3]),2)
+        view=adv.group_records.VIEWS[1]
+        await self.click(f'dx_be_{view["token"]}_0')
+        await bot.handle_message(Update(text='8.8.8.8'),self.context)
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertEqual({r['content'] for r in self.records.values()},{'8.8.8.8'})
+
+    async def test_members_control_groups_name_across_ips_and_confirms_removal(self):
+        await self.create('2.2.2.2')
+        update=await self.click(f'dx_members_{G}_0')
+        view=adv.group_records.MEMBER_VIEWS[1]
+        self.assertEqual(len(view['entries']),1)
+        self.assertEqual(len(view['entries'][0]['pairs']),2)
+        await self.click(f'dx_mpick_{view["token"]}_0')
+        self.assertEqual(len(adv.group_records.selected_pairs(adv,1,G)),2)
+        await self.click('dx_apply_'+adv.PENDING[1]['token'])
+        self.assertEqual(adv.group_records.selected_pairs(adv,1,G),set())
+        self.assertEqual(len(self.records),2)
+        self.assertEqual(len(self.writes),1)
+
+    async def test_member_removal_cancel_and_changed_membership_are_safe(self):
+        await self.click(f'dx_members_{G}_0')
+        view=adv.group_records.MEMBER_VIEWS[1]
+        await self.click(f'dx_mpick_{view["token"]}_0')
+        await self.click(f'dx_members_{G}_0')
+        self.assertNotIn(1,adv.PENDING)
+        self.assertEqual(len(adv.members(G)),1)
+        view=adv.group_records.MEMBER_VIEWS[1]
+        await self.click(f'dx_mpick_{view["token"]}_0')
+        token=adv.PENDING[1]['token']
+        with adv.db() as c:c.execute('INSERT INTO dns_group_members VALUES(?,?,?)',(G,Z,'f'*32))
+        with self.assertRaises(ValueError):await adv.execute(Update(),bot,1,token)
+        self.assertEqual(len(adv.members(G)),2)
+        self.assertEqual(self.writes,[])
+
+    async def test_member_control_rejects_another_users_keyboard(self):
+        await self.click(f'dx_members_{G}_0')
+        view=adv.group_records.MEMBER_VIEWS[1]
+        await self.click(f'dx_mpick_{view["token"]}_0',2)
+        self.assertNotIn(2,adv.PENDING)
+        self.assertEqual(len(adv.members(G)),1)
+
+    async def test_can_copy_again_after_the_first_ip_was_deleted(self):
+        await self.create('2.2.2.2')
+        cf.delete_dns_record(Z,R)
+        self.assertEqual(len(adv.members(G)),0)
+        await self.click(f'dx_cnew_{G}')
+        await bot.handle_message(Update(text='3.3.3.3'),self.context)
+        self.assertIn(1,clones.PLANS)
+        await self.click('dx_capply_'+clones.PLANS[1][0])
+        self.assertEqual({r['content'] for r in self.records.values()},{'2.2.2.2','3.3.3.3'})
+
+    async def test_four_members_on_two_ips_render_as_exactly_two_three_button_rows(self):
+        for n in range(3):
+            rid=f'{n+100:032x}'
+            self.records[(Z,rid)]=dict(self.records[(Z,R)],id=rid,name=f'node{n}.example.com')
+            with adv.db() as c:c.execute('INSERT INTO dns_group_members VALUES(?,?,?)',(G,Z,rid))
+        await self.create('2.2.2.2')
+        update=await self.click('dx_g_'+G)
+        ip_rows=[row for row in update.message.frames[-1][1] if len(row)==3 and row[1].text=='✏️' and row[2].text=='🗑']
+        self.assertEqual(len(ip_rows),2)
+        self.assertEqual({row[0].text for row in ip_rows},{'1.1.1.1','2.2.2.2'})
+        self.assertEqual(len(self.records),8)
 
     async def test_proxy_enabled_always_uses_auto_ttl(self):
         self.assertTrue(cf.update_dns_record(Z,R,'node.example.com','A','1.1.1.1',300,True))
